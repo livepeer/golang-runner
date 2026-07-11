@@ -40,6 +40,11 @@ type Channel struct {
 	MimeType    string `json:"mime_type"`
 }
 
+type Proxy struct {
+	ProxyID string `json:"proxy_id"`
+	URL     string `json:"url"`
+}
+
 type SessionEvent struct {
 	SessionID string
 	Event     string

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"net/url"
 	"strings"
 )
 
@@ -68,28 +67,5 @@ func DeleteTrickleChannels(ctx context.Context, client HTTPDoer, orchestratorURL
 }
 
 func channelsEndpoint(orchestratorURL, runnerID string, req *http.Request) (string, string, error) {
-	if req == nil {
-		return "", "", errors.New("request is required")
-	}
-	sessionID := strings.TrimSpace(req.Header.Get(HeaderSessionID))
-	token := strings.TrimSpace(SessionToken(req))
-	controlURL := strings.TrimSpace(SessionControl(req))
-	if sessionID == "" {
-		return "", "", errors.New("session_id is required")
-	}
-	if token == "" {
-		return "", "", errors.New("session_token is required")
-	}
-	if controlURL != "" {
-		endpoint, err := joinEndpoint(controlURL, "channels")
-		return endpoint, token, err
-	}
-	if runnerID == "" {
-		runnerID = strings.TrimSpace(req.Header.Get(HeaderRunnerRoute))
-	}
-	if runnerID == "" {
-		return "", "", errors.New("runner_id is required")
-	}
-	endpoint, err := joinEndpoint(orchestratorURL, "/runner/"+url.PathEscape(runnerID)+"/session/"+url.PathEscape(sessionID)+"/channels")
-	return endpoint, token, err
+	return sessionEndpoint(orchestratorURL, runnerID, req, "channels")
 }

@@ -298,12 +298,26 @@ func TestHeartbeat401RetriesBootstrapSecret(t *testing.T) {
 	}
 }
 
-func TestHeadersChannelsAndStopHelpers(t *testing.T) {
+func TestHeadersProxyChannelsAndStopUseSessionControl(t *testing.T) {
 	ctx := context.Background()
 	var seen []string
 	orch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seen = append(seen, r.Method+" "+r.URL.Path+" token="+r.Header.Get(HeaderSessionToken))
 		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/runner/runner-1/session/session-1/proxy":
+			var payload createProxyRequest
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Errorf("decode proxy payload: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if payload.TargetURL != "http://runner.example.com:7860/app" {
+				t.Errorf("proxy target_url = %q", payload.TargetURL)
+			}
+			json.NewEncoder(w).Encode(Proxy{
+				ProxyID: "proxy-1",
+				URL:     "https://proxy.example.com",
+			})
 		case r.Method == http.MethodPost && r.URL.Path == "/runner/runner-1/session/session-1/channels":
 			json.NewEncoder(w).Encode(createChannelsResponse{Channels: []Channel{{
 				Name:        "events",
@@ -323,12 +337,17 @@ func TestHeadersChannelsAndStopHelpers(t *testing.T) {
 	}))
 	defer orch.Close()
 	req := httptest.NewRequest(http.MethodGet, "http://runner/app", nil)
-	req.Header.Set(HeaderSessionID, "session-1")
 	req.Header.Set(HeaderSessionToken, "token-1")
 	req.Header.Set(HeaderSessionControl, orch.URL+"/runner/runner-1/session/session-1")
-	req.Header.Set(HeaderRunnerRoute, "runner-1")
 	if SessionToken(req) != "token-1" || SessionControl(req) != orch.URL+"/runner/runner-1/session/session-1" {
 		t.Fatal("header helpers returned unexpected values")
+	}
+	proxy, err := CreateProxy(ctx, nil, "", "", req, "http://runner.example.com:7860/app")
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	if proxy.ProxyID != "proxy-1" || proxy.URL != "https://proxy.example.com" {
+		t.Fatalf("proxy = %#v", proxy)
 	}
 	channels, err := CreateTrickleChannels(ctx, nil, "", "", req, []ChannelRequest{{Name: "events", MimeType: "application/jsonl"}})
 	if err != nil {
@@ -348,12 +367,38 @@ func TestHeadersChannelsAndStopHelpers(t *testing.T) {
 		t.Fatalf("stop session: %v", err)
 	}
 	want := []string{
+		"POST /runner/runner-1/session/session-1/proxy token=token-1",
 		"POST /runner/runner-1/session/session-1/channels token=token-1",
 		"DELETE /runner/runner-1/session/session-1/channels token=token-1",
 		"POST /runner/runner-1/session/session-1/stop token=token-1",
 	}
 	if !reflect.DeepEqual(seen, want) {
 		t.Fatalf("seen = %#v", seen)
+	}
+}
+
+func TestCreateProxyFallsBackToRunnerRouteHeader(t *testing.T) {
+	ctx := context.Background()
+	var gotPath string
+	orch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		json.NewEncoder(w).Encode(Proxy{ProxyID: "proxy-2", URL: "https://proxy.example.com/2"})
+	}))
+	defer orch.Close()
+
+	req := httptest.NewRequest(http.MethodGet, "http://runner/app", nil)
+	req.Header.Set(HeaderSessionID, "session/1")
+	req.Header.Set(HeaderSessionToken, "token-1")
+	req.Header.Set(HeaderRunnerRoute, "runner/1")
+	proxy, err := CreateProxy(ctx, nil, orch.URL+"/api", "", req, "http://runner.example.com/app")
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	if proxy.ProxyID != "proxy-2" {
+		t.Fatalf("proxy = %#v", proxy)
+	}
+	if gotPath != "/api/runner/runner%2F1/session/session%2F1/proxy" {
+		t.Fatalf("path = %q", gotPath)
 	}
 }
 
