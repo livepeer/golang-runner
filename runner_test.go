@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,6 +25,93 @@ func TestRunnerRejectsUnknownModeBeforeRegistration(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected unknown mode error")
+	}
+}
+
+func TestBuildVersionUsesModuleVersionOrVCSRevision(t *testing.T) {
+	tests := []struct {
+		name string
+		info debug.BuildInfo
+		want string
+	}{
+		{
+			name: "main module release",
+			info: debug.BuildInfo{
+				Main: debug.Module{Path: modulePath, Version: "v1.2.3"},
+				Settings: []debug.BuildSetting{
+					{Key: "vcs.revision", Value: "abc123"},
+				},
+			},
+			want: "v1.2.3",
+		},
+		{
+			name: "main module devel falls back to revision",
+			info: debug.BuildInfo{
+				Main: debug.Module{Path: modulePath, Version: "(devel)"},
+				Settings: []debug.BuildSetting{
+					{Key: "vcs.revision", Value: "abc123"},
+				},
+			},
+			want: "abc123",
+		},
+		{
+			name: "main module devel falls back to dirty revision",
+			info: debug.BuildInfo{
+				Main: debug.Module{Path: modulePath, Version: "(devel)"},
+				Settings: []debug.BuildSetting{
+					{Key: "vcs.revision", Value: "abc123"},
+					{Key: "vcs.modified", Value: "true"},
+				},
+			},
+			want: "abc123-dirty",
+		},
+		{
+			name: "dependency module release",
+			info: debug.BuildInfo{
+				Main: debug.Module{Path: "example.com/app", Version: "(devel)"},
+				Deps: []*debug.Module{
+					{Path: modulePath, Version: "v0.4.0"},
+				},
+				Settings: []debug.BuildSetting{
+					{Key: "vcs.revision", Value: "appsha"},
+				},
+			},
+			want: "v0.4.0",
+		},
+		{
+			name: "dependency module devel falls back to revision",
+			info: debug.BuildInfo{
+				Main: debug.Module{Path: "example.com/app", Version: "(devel)"},
+				Deps: []*debug.Module{
+					{Path: modulePath, Version: "(devel)"},
+				},
+				Settings: []debug.BuildSetting{
+					{Key: "vcs.revision", Value: "appsha"},
+				},
+			},
+			want: "appsha",
+		},
+		{
+			name: "dependency module devel falls back to dirty revision",
+			info: debug.BuildInfo{
+				Main: debug.Module{Path: "example.com/app", Version: "(devel)"},
+				Deps: []*debug.Module{
+					{Path: modulePath, Version: "(devel)"},
+				},
+				Settings: []debug.BuildSetting{
+					{Key: "vcs.revision", Value: "appsha"},
+					{Key: "vcs.modified", Value: "true"},
+				},
+			},
+			want: "appsha-dirty",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := buildVersion(&tt.info); got != tt.want {
+				t.Fatalf("buildVersion() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -88,7 +176,6 @@ func TestRunnerRegistrationHeartbeatO2RAndUnregister(t *testing.T) {
 		Capacity:          2,
 		Status:            "ready",
 		Label:             "echo-a",
-		Version:           "v1",
 		PriceInfo:         PriceInfo{PricePerUnit: 12, PixelsPerUnit: 34, Unit: "USD"},
 		GPU:               &GPU{ID: "gpu-1", Name: "NVIDIA", VRAMMB: 24576},
 		UnregisterOnClose: true,

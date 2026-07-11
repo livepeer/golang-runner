@@ -58,7 +58,6 @@ type Options struct {
 	Capacity        int
 	Status          string
 	Label           string
-	Version         string
 	GPU             *GPU
 	PriceInfo       PriceInfo
 	RunnerID        string

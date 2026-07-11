@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +15,7 @@ import (
 const (
 	defaultHeartbeatInterval = 5 * time.Second
 	defaultTimeout           = 5 * time.Second
+	modulePath               = "github.com/livepeer/golang-runner"
 )
 
 type Runner struct {
@@ -125,7 +127,7 @@ func New(opts Options) (*Runner, error) {
 		capacity:          capacity,
 		status:            status,
 		label:             opts.Label,
-		version:           opts.Version,
+		version:           moduleVersion(),
 		gpu:               opts.GPU,
 		priceInfo:         opts.PriceInfo,
 		runnerID:          strings.TrimSpace(opts.RunnerID),
@@ -137,6 +139,49 @@ func New(opts Options) (*Runner, error) {
 		onReserve:         opts.OnReserve,
 		onRelease:         opts.OnRelease,
 	}, nil
+}
+
+func moduleVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return ""
+	}
+	return buildVersion(info)
+}
+
+func buildVersion(info *debug.BuildInfo) string {
+	if info.Main.Path == modulePath {
+		return getVersion(info.Main.Version, info.Settings)
+	}
+	for _, dep := range info.Deps {
+		if dep.Path == modulePath {
+			return getVersion(dep.Version, info.Settings)
+		}
+	}
+	return ""
+}
+
+func getVersion(version string, settings []debug.BuildSetting) string {
+	if version != "" && version != "(devel)" {
+		return version
+	}
+	revision := ""
+	modified := false
+	for _, setting := range settings {
+		switch setting.Key {
+		case "vcs.revision":
+			revision = setting.Value
+		case "vcs.modified":
+			modified = setting.Value == "true"
+		}
+	}
+	if revision == "" {
+		return ""
+	}
+	if modified {
+		return revision + "-dirty"
+	}
+	return revision
 }
 
 func Register(ctx context.Context, opts Options) (*Runner, error) {
