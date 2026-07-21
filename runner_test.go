@@ -405,6 +405,34 @@ func TestHeadersProxyChannelsAndStopUseSessionControl(t *testing.T) {
 	}
 }
 
+func TestCreateProxyAllowsDefaultTarget(t *testing.T) {
+	ctx := context.Background()
+	var payload map[string]string
+	orch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode proxy payload: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		json.NewEncoder(w).Encode(Proxy{ProxyID: "proxy-2", URL: "https://proxy.example.com/default"})
+	}))
+	defer orch.Close()
+
+	req := httptest.NewRequest(http.MethodGet, "http://runner/app", nil)
+	req.Header.Set(HeaderSessionToken, "token-1")
+	req.Header.Set(HeaderSessionControl, orch.URL+"/runner/runner-1/session/session-1")
+	proxy, err := CreateProxy(ctx, nil, "", "", req, "")
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	if proxy.ProxyID != "proxy-2" || proxy.URL != "https://proxy.example.com/default" {
+		t.Fatalf("proxy = %#v", proxy)
+	}
+	if _, ok := payload["target_url"]; ok {
+		t.Fatalf("expected default proxy payload to omit target_url, got %#v", payload)
+	}
+}
+
 func TestCreateProxyFallsBackToRunnerRouteHeader(t *testing.T) {
 	ctx := context.Background()
 	var gotPath string

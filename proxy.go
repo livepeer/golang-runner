@@ -8,7 +8,7 @@ import (
 )
 
 type createProxyRequest struct {
-	TargetURL string `json:"target_url"`
+	TargetURL string `json:"target_url,omitempty"`
 }
 
 func (r *Runner) CreateProxy(ctx context.Context, req *http.Request, targetURL string) (Proxy, error) {
@@ -17,9 +17,6 @@ func (r *Runner) CreateProxy(ctx context.Context, req *http.Request, targetURL s
 
 func CreateProxy(ctx context.Context, client HTTPDoer, orchestratorURL, runnerID string, req *http.Request, targetURL string) (Proxy, error) {
 	targetURL = strings.TrimSpace(targetURL)
-	if targetURL == "" {
-		return Proxy{}, errors.New("target_url is required")
-	}
 	endpoint, token, err := proxyEndpoint(orchestratorURL, runnerID, req)
 	if err != nil {
 		return Proxy{}, err
