@@ -59,6 +59,7 @@ type Options struct {
 	BootstrapSecret string
 	RunnerURL       string
 	App             string
+	Metadata        string
 	Mode            string
 	Capacity        int
 	Status          string

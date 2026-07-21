@@ -26,6 +26,7 @@ type Runner struct {
 	heartbeatSecret string
 	runnerURL       string
 	app             string
+	metadata        string
 	mode            string
 	capacity        int
 	status          string
@@ -57,6 +58,7 @@ type heartbeatRequest struct {
 	Label      string    `json:"label,omitempty"`
 	RunnerURL  string    `json:"runner_url"`
 	Version    string    `json:"version,omitempty"`
+	Metadata   string    `json:"metadata,omitempty"`
 	Status     string    `json:"status,omitempty"`
 	Mode       string    `json:"mode,omitempty"`
 	GPU        *GPU      `json:"gpu,omitempty"`
@@ -123,6 +125,7 @@ func New(opts Options) (*Runner, error) {
 		bootstrapSecret:   opts.BootstrapSecret,
 		runnerURL:         opts.RunnerURL,
 		app:               opts.App,
+		metadata:          opts.Metadata,
 		mode:              mode,
 		capacity:          capacity,
 		status:            status,
@@ -355,6 +358,7 @@ func (r *Runner) payloadLocked() heartbeatRequest {
 		Label:      r.label,
 		RunnerURL:  r.runnerURL,
 		Version:    r.version,
+		Metadata:   r.metadata,
 		Status:     r.status,
 		Mode:       r.mode,
 		GPU:        r.gpu,

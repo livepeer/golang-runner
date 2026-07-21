@@ -172,6 +172,7 @@ func TestRunnerRegistrationHeartbeatO2RAndUnregister(t *testing.T) {
 		BootstrapSecret:   "bootstrap-secret",
 		RunnerURL:         "http://runner.example/app",
 		App:               "livepeer-sample/echo",
+		Metadata:          `{"region":"us-west","tier":"warm"}`,
 		Mode:              ModePersistent,
 		Capacity:          2,
 		Status:            "ready",
@@ -253,6 +254,33 @@ func TestRunnerRegistrationHeartbeatO2RAndUnregister(t *testing.T) {
 	}
 	if payloads[0].PriceInfo.PricePerUnit != 12 || payloads[0].GPU.Name != "NVIDIA" {
 		t.Fatalf("missing price/gpu payload: %#v", payloads[0])
+	}
+	for _, payload := range payloads {
+		if payload.Metadata != `{"region":"us-west","tier":"warm"}` {
+			t.Fatalf("missing metadata payload: %#v", payload)
+		}
+	}
+}
+
+func TestRunnerPayloadOmitsEmptyMetadata(t *testing.T) {
+	r, err := New(Options{
+		OrchestratorURL: "http://127.0.0.1",
+		BootstrapSecret: "bootstrap",
+		RunnerURL:       "http://runner",
+		App:             "app",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.mu.Lock()
+	payload := r.payloadLocked()
+	r.mu.Unlock()
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), `"metadata"`) {
+		t.Fatalf("empty metadata should be omitted: %s", data)
 	}
 }
 
