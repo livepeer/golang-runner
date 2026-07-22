@@ -174,6 +174,7 @@ func TestRunnerRegistrationHeartbeatO2RAndUnregister(t *testing.T) {
 		App:               "livepeer-sample/echo",
 		Metadata:          `{"region":"us-west","tier":"warm"}`,
 		Mode:              ModePersistent,
+		Proxy:             true,
 		Capacity:          2,
 		Status:            "ready",
 		Label:             "echo-a",
@@ -259,6 +260,9 @@ func TestRunnerRegistrationHeartbeatO2RAndUnregister(t *testing.T) {
 		if payload.Metadata != `{"region":"us-west","tier":"warm"}` {
 			t.Fatalf("missing metadata payload: %#v", payload)
 		}
+		if !payload.Proxy {
+			t.Fatalf("missing proxy payload: %#v", payload)
+		}
 	}
 }
 
@@ -281,6 +285,9 @@ func TestRunnerPayloadOmitsEmptyMetadata(t *testing.T) {
 	}
 	if strings.Contains(string(data), `"metadata"`) {
 		t.Fatalf("empty metadata should be omitted: %s", data)
+	}
+	if strings.Contains(string(data), `"proxy"`) {
+		t.Fatalf("disabled proxy should be omitted: %s", data)
 	}
 }
 

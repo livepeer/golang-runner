@@ -61,6 +61,7 @@ type Options struct {
 	App             string
 	Metadata        string
 	Mode            string
+	Proxy           bool
 	Capacity        int
 	Status          string
 	Label           string
