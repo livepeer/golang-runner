@@ -1,13 +1,21 @@
 package liverunner
 
 import (
+	"encoding/json"
+	"fmt"
+	"math/big"
 	"net/http"
+	"strings"
 	"time"
 )
 
 const (
-	ModePersistent = "persistent"
-	ModeSingleShot = "single-shot"
+	ModePersistent   = "persistent"
+	ModeSingleShot   = "single-shot"
+	PriceCurrencyUSD = "usd"
+	PriceUnitHour    = "hour"
+	PriceUnit720p    = "720p"
+	PriceUnitFixed   = "fixed"
 
 	HeaderSessionID      = "Livepeer-Session-Id"
 	HeaderSessionToken   = "Livepeer-Session-Token"
@@ -22,9 +30,51 @@ type GPU struct {
 }
 
 type PriceInfo struct {
-	PricePerUnit  int64  `json:"price_per_unit"`
-	PixelsPerUnit int64  `json:"pixels_per_unit"`
-	Unit          string `json:"unit,omitempty"`
+	Price    json.Number `json:"price"`
+	Currency string      `json:"currency"`
+	Unit     string      `json:"unit"`
+}
+
+// NewPriceInfo constructs registration-side pricing. Registration prices are
+// denominated in USD and use hour, 720p, or fixed units. The orchestrator
+// converts them to the payment price advertised through discovery.
+func NewPriceInfo(price, currency, unit string) (PriceInfo, error) {
+	return normalizePriceInfo(PriceInfo{
+		Price:    json.Number(strings.TrimSpace(price)),
+		Currency: currency,
+		Unit:     unit,
+	})
+}
+
+func normalizePriceInfo(priceInfo PriceInfo) (PriceInfo, error) {
+	price := strings.TrimSpace(priceInfo.Price.String())
+	if price == "" {
+		price = "0"
+	}
+	if _, err := json.Marshal(json.Number(price)); err != nil {
+		return PriceInfo{}, fmt.Errorf("live runner price must be a valid JSON number: %w", err)
+	}
+	priceRat, ok := new(big.Rat).SetString(price)
+	if !ok || priceRat.Sign() < 0 {
+		return PriceInfo{}, fmt.Errorf("live runner price must be a non-negative decimal")
+	}
+	currency := strings.ToLower(strings.TrimSpace(priceInfo.Currency))
+	if currency == "" {
+		currency = PriceCurrencyUSD
+	}
+	if currency != PriceCurrencyUSD {
+		return PriceInfo{}, fmt.Errorf("live runner price currency must be %q", PriceCurrencyUSD)
+	}
+	unit := strings.ToLower(strings.TrimSpace(priceInfo.Unit))
+	if unit == "" {
+		unit = PriceUnitHour
+	}
+	switch unit {
+	case PriceUnitHour, PriceUnit720p, PriceUnitFixed:
+	default:
+		return PriceInfo{}, fmt.Errorf("live runner price unit must be %q, %q, or %q", PriceUnitHour, PriceUnit720p, PriceUnitFixed)
+	}
+	return PriceInfo{Price: json.Number(price), Currency: currency, Unit: unit}, nil
 }
 
 type ChannelRequest struct {

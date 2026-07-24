@@ -15,6 +15,77 @@ import (
 	"time"
 )
 
+func TestNewPriceInfo(t *testing.T) {
+	tests := []struct {
+		name     string
+		price    string
+		currency string
+		unit     string
+		want     PriceInfo
+		wantErr  string
+	}{
+		{
+			name: "defaults",
+			want: PriceInfo{
+				Price:    json.Number("0"),
+				Currency: PriceCurrencyUSD,
+				Unit:     PriceUnitHour,
+			},
+		},
+		{
+			name:     "normalizes casing and whitespace",
+			price:    " 12.50 ",
+			currency: " USD ",
+			unit:     " FIXED ",
+			want: PriceInfo{
+				Price:    json.Number("12.50"),
+				Currency: PriceCurrencyUSD,
+				Unit:     PriceUnitFixed,
+			},
+		},
+		{
+			name:    "rejects negative price",
+			price:   "-0.01",
+			wantErr: "non-negative decimal",
+		},
+		{
+			name:    "rejects malformed price",
+			price:   "not-a-number",
+			wantErr: "valid JSON number",
+		},
+		{
+			name:     "rejects unsupported currency",
+			price:    "1",
+			currency: "eur",
+			wantErr:  `currency must be "usd"`,
+		},
+		{
+			name:    "rejects unsupported unit",
+			price:   "1",
+			unit:    "minute",
+			wantErr: `unit must be "hour", "720p", or "fixed"`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := NewPriceInfo(tt.price, tt.currency, tt.unit)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("NewPriceInfo() error = %v, want error containing %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("NewPriceInfo() error = %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("NewPriceInfo() = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestRunnerRejectsUnknownModeBeforeRegistration(t *testing.T) {
 	_, err := New(Options{
 		OrchestratorURL: "http://127.0.0.1",
@@ -178,7 +249,7 @@ func TestRunnerRegistrationHeartbeatO2RAndUnregister(t *testing.T) {
 		Capacity:          2,
 		Status:            "ready",
 		Label:             "echo-a",
-		PriceInfo:         PriceInfo{PricePerUnit: 12, PixelsPerUnit: 34, Unit: "USD"},
+		PriceInfo:         PriceInfo{Price: json.Number("12.5"), Currency: "USD", Unit: "FIXED"},
 		GPU:               &GPU{ID: "gpu-1", Name: "NVIDIA", VRAMMB: 24576},
 		UnregisterOnClose: true,
 		OnReserve: func(ev SessionEvent) {
@@ -253,7 +324,7 @@ func TestRunnerRegistrationHeartbeatO2RAndUnregister(t *testing.T) {
 	if len(payloads) == 0 || payloads[0].RunnerURL != "http://runner.example/app" || payloads[0].App != "livepeer-sample/echo" {
 		t.Fatalf("bad heartbeat payload: %#v", payloads)
 	}
-	if payloads[0].PriceInfo.PricePerUnit != 12 || payloads[0].GPU.Name != "NVIDIA" {
+	if payloads[0].PriceInfo.Price.String() != "12.5" || payloads[0].PriceInfo.Currency != "usd" || payloads[0].PriceInfo.Unit != "fixed" || payloads[0].GPU.Name != "NVIDIA" {
 		t.Fatalf("missing price/gpu payload: %#v", payloads[0])
 	}
 	for _, payload := range payloads {

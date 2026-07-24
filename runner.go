@@ -89,6 +89,10 @@ func New(opts Options) (*Runner, error) {
 	if err != nil {
 		return nil, err
 	}
+	priceInfo, err := normalizePriceInfo(opts.PriceInfo)
+	if err != nil {
+		return nil, err
+	}
 	if strings.TrimSpace(opts.BootstrapSecret) == "" {
 		return nil, errors.New("bootstrap secret is required")
 	}
@@ -135,7 +139,7 @@ func New(opts Options) (*Runner, error) {
 		label:             opts.Label,
 		version:           moduleVersion(),
 		gpu:               opts.GPU,
-		priceInfo:         opts.PriceInfo,
+		priceInfo:         priceInfo,
 		runnerID:          strings.TrimSpace(opts.RunnerID),
 		client:            opts.HTTPClient,
 		timeout:           timeout,
