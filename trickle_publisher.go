@@ -1,7 +1,6 @@
 package liverunner
 
 import (
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -303,9 +302,6 @@ func httpClient() *http.Client {
 	return &http.Client{Transport: &http.Transport{
 		// Re-enable keepalives to avoid connection pooling
 		// DisableKeepAlives: true,
-		// ignore orch certs for now
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-
 		// Prevent old TCP connections from accumulating
 		IdleConnTimeout: 1 * time.Minute,
 	}}
