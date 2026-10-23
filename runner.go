@@ -443,7 +443,8 @@ func (r *Runner) HandleO2RMessage(message map[string]any) {
 		return
 	}
 	timestamp, _ := message["timestamp"].(string)
-	ev := SessionEvent{SessionID: sessionID, Event: event, Timestamp: timestamp, Raw: message}
+	token, _ := message["session_token"].(string)
+	ev := SessionEvent{SessionID: sessionID, SessionToken: token, Event: event, Timestamp: timestamp, Raw: message}
 	var cb Callback
 	r.mu.Lock()
 	if event == "reserved" {

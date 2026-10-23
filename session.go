@@ -63,13 +63,39 @@ func sessionEndpoint(orchestratorURL, runnerID string, req *http.Request, suffix
 	return endpoint, token, err
 }
 
+func (r *Runner) StopSession(ctx context.Context, sessionID, sessionToken string) error {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return errors.New("session_id is required")
+	}
+	sessionToken = strings.TrimSpace(sessionToken)
+	if sessionToken == "" {
+		return errors.New("session_token is required")
+	}
+	r.mu.Lock()
+	base, runnerID, client, timeout := r.orchestratorURL, r.runnerID, r.client, r.timeout
+	r.mu.Unlock()
+	if runnerID == "" {
+		return errors.New("runner_id is required")
+	}
+	endpoint, err := url.JoinPath(base, "runner", url.PathEscape(runnerID), "session", url.PathEscape(sessionID), "stop")
+	if err != nil {
+		return err
+	}
+	return stopSession(ctx, client, endpoint, sessionToken, timeout)
+}
+
 func StopSession(ctx context.Context, client HTTPDoer, req *http.Request, timeout time.Duration) error {
 	endpoint, err := sessionControlEndpoint(req, "stop")
 	if err != nil {
 		return err
 	}
+	return stopSession(ctx, client, endpoint, SessionToken(req), timeout)
+}
+
+func stopSession(ctx context.Context, client HTTPDoer, endpoint, token string, timeout time.Duration) error {
 	headers := map[string]string{}
-	if token := strings.TrimSpace(SessionToken(req)); token != "" {
+	if token = strings.TrimSpace(token); token != "" {
 		headers[HeaderSessionToken] = token
 	}
 	if timeout <= 0 {

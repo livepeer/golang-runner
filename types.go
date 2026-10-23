@@ -96,10 +96,11 @@ type Proxy struct {
 }
 
 type SessionEvent struct {
-	SessionID string
-	Event     string
-	Timestamp string
-	Raw       map[string]any
+	SessionID    string
+	SessionToken string
+	Event        string
+	Timestamp    string
+	Raw          map[string]any
 }
 
 type Callback func(SessionEvent)
