@@ -31,7 +31,6 @@ type Runner struct {
 	proxy           bool
 	capacity        int
 	status          string
-	label           string
 	version         string
 	gpu             *GPU
 	priceInfo       PriceInfo
@@ -56,7 +55,6 @@ type Runner struct {
 
 type heartbeatRequest struct {
 	RunnerID   string    `json:"runner_id,omitempty"`
-	Label      string    `json:"label,omitempty"`
 	RunnerURL  string    `json:"runner_url"`
 	Version    string    `json:"version,omitempty"`
 	Metadata   string    `json:"metadata,omitempty"`
@@ -136,7 +134,6 @@ func New(opts Options) (*Runner, error) {
 		proxy:             opts.Proxy,
 		capacity:          capacity,
 		status:            status,
-		label:             opts.Label,
 		version:           moduleVersion(),
 		gpu:               opts.GPU,
 		priceInfo:         priceInfo,
@@ -362,7 +359,6 @@ func (r *Runner) postHeartbeat(ctx context.Context, auth string) (*heartbeatResp
 func (r *Runner) payloadLocked() heartbeatRequest {
 	return heartbeatRequest{
 		RunnerID:   r.runnerID,
-		Label:      r.label,
 		RunnerURL:  r.runnerURL,
 		Version:    r.version,
 		Metadata:   r.metadata,

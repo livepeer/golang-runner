@@ -56,5 +56,4 @@ RUNNER_LISTEN_ADDR=:8080
 RUNNER_APP=livepeer-sample/stdin-stdout
 RUNNER_MODE=persistent
 RUNNER_CAPACITY=1
-RUNNER_LABEL=stdin-stdout-a
 ```

@@ -28,7 +28,6 @@ type config struct {
 	app             string
 	mode            string
 	capacity        int
-	label           string
 	register        bool
 	command         []string
 }
@@ -92,7 +91,6 @@ func run(ctx context.Context, cfg config, logger *slog.Logger) error {
 			App:             cfg.app,
 			Mode:            cfg.mode,
 			Capacity:        cfg.capacity,
-			Label:           cfg.label,
 		})
 		if err != nil {
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -210,7 +208,6 @@ func parseConfig(args []string) (config, error) {
 		app:             envString("RUNNER_APP", "livepeer-sample/stdin-stdout"),
 		mode:            envString("RUNNER_MODE", liverunner.ModePersistent),
 		capacity:        capacity,
-		label:           envString("RUNNER_LABEL", ""),
 		register:        register,
 	}
 
@@ -222,7 +219,6 @@ func parseConfig(args []string) (config, error) {
 	fs.StringVar(&cfg.app, "app", cfg.app, "runner app name, or RUNNER_APP")
 	fs.StringVar(&cfg.mode, "mode", cfg.mode, "runner mode, or RUNNER_MODE")
 	fs.IntVar(&cfg.capacity, "capacity", cfg.capacity, "runner capacity, or RUNNER_CAPACITY")
-	fs.StringVar(&cfg.label, "label", cfg.label, "runner label, or RUNNER_LABEL")
 	fs.BoolVar(&cfg.register, "register", cfg.register, "register with the Livepeer orchestrator, or RUNNER_REGISTER")
 	if err := fs.Parse(args); err != nil {
 		return config{}, err

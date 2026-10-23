@@ -114,7 +114,6 @@ type Options struct {
 	Proxy           bool
 	Capacity        int
 	Status          string
-	Label           string
 	GPU             *GPU
 	PriceInfo       PriceInfo
 	RunnerID        string

@@ -248,7 +248,6 @@ func TestRunnerRegistrationHeartbeatO2RAndUnregister(t *testing.T) {
 		Proxy:             true,
 		Capacity:          2,
 		Status:            "ready",
-		Label:             "echo-a",
 		PriceInfo:         PriceInfo{Price: json.Number("12.5"), Currency: "USD", Unit: "FIXED"},
 		GPU:               &GPU{ID: "gpu-1", Name: "NVIDIA", VRAMMB: 24576},
 		UnregisterOnClose: true,
