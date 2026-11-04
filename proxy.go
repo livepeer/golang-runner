@@ -12,12 +12,12 @@ type createProxyRequest struct {
 }
 
 func (r *Runner) CreateProxy(ctx context.Context, req *http.Request, targetURL string) (Proxy, error) {
-	return CreateProxy(ctx, r.client, r.OrchestratorURL(), r.RunnerID(), req, targetURL)
+	return CreateProxy(ctx, r.client, r.OrchestratorURL(), req, targetURL)
 }
 
-func CreateProxy(ctx context.Context, client HTTPDoer, orchestratorURL, runnerID string, req *http.Request, targetURL string) (Proxy, error) {
+func CreateProxy(ctx context.Context, client HTTPDoer, orchestratorURL string, req *http.Request, targetURL string) (Proxy, error) {
 	targetURL = strings.TrimSpace(targetURL)
-	endpoint, token, err := proxyEndpoint(orchestratorURL, runnerID, req)
+	endpoint, token, err := sessionEndpoint(orchestratorURL, req, "proxy")
 	if err != nil {
 		return Proxy{}, err
 	}
@@ -29,8 +29,4 @@ func CreateProxy(ctx context.Context, client HTTPDoer, orchestratorURL, runnerID
 		return Proxy{}, errors.New("live runner proxy response missing proxy_id or url")
 	}
 	return resp, nil
-}
-
-func proxyEndpoint(orchestratorURL, runnerID string, req *http.Request) (string, string, error) {
-	return sessionEndpoint(orchestratorURL, runnerID, req, "proxy")
 }

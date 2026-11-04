@@ -96,6 +96,7 @@ type Proxy struct {
 }
 
 type SessionEvent struct {
+	AppID        string
 	SessionID    string
 	SessionToken string
 	Event        string
@@ -105,19 +106,26 @@ type SessionEvent struct {
 
 type Callback func(SessionEvent)
 
+// AppOptions configures one app registration owned by a runner.
+type AppOptions struct {
+	ID        string    `json:"id,omitempty"` // Optional; the orchestrator assigns an ID when empty.
+	App       string    `json:"app"`
+	RunnerURL string    `json:"runner_url"`
+	Version   string    `json:"version,omitempty"` // Application version, separate from the runner SDK version.
+	Metadata  string    `json:"metadata,omitempty"`
+	Mode      string    `json:"mode,omitempty"`
+	Proxy     bool      `json:"proxy,omitempty"`
+	Capacity  int       `json:"capacity"`
+	Status    string    `json:"status,omitempty"`
+	GPU       *GPU      `json:"gpu,omitempty"`
+	PriceInfo PriceInfo `json:"price_info"`
+}
+
 type Options struct {
 	OrchestratorURL string
 	BootstrapSecret string
-	RunnerURL       string
-	App             string
-	Metadata        string
-	Mode            string
-	Proxy           bool
-	Capacity        int
-	Status          string
-	GPU             *GPU
-	PriceInfo       PriceInfo
 	RunnerID        string
+	Apps            []AppOptions
 
 	HTTPClient               HTTPDoer
 	HeartbeatInterval        time.Duration

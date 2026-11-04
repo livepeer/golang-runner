@@ -3,10 +3,12 @@ package liverunner
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -24,17 +26,9 @@ type Runner struct {
 	orchestratorURL string
 	bootstrapSecret string
 	heartbeatSecret string
-	runnerURL       string
-	app             string
-	metadata        string
-	mode            string
-	proxy           bool
-	capacity        int
-	status          string
 	version         string
-	gpu             *GPU
-	priceInfo       PriceInfo
 	runnerID        string
+	apps            []appRequest
 
 	client              HTTPDoer
 	timeout             time.Duration
@@ -44,38 +38,37 @@ type Runner struct {
 	unregisterOnClose   bool
 	onReserve           Callback
 	onRelease           Callback
-	activeSessionIDs    []string
 	o2r                 *Channel
 	o2rCancel           context.CancelFunc
 	closed              bool
-	started             bool
 	heartbeatLoopCancel context.CancelFunc
 	wg                  sync.WaitGroup
 }
 
 type heartbeatRequest struct {
-	RunnerID   string    `json:"runner_id,omitempty"`
-	RunnerURL  string    `json:"runner_url"`
-	Version    string    `json:"version,omitempty"`
-	Metadata   string    `json:"metadata,omitempty"`
-	Status     string    `json:"status,omitempty"`
-	Mode       string    `json:"mode,omitempty"`
-	Proxy      bool      `json:"proxy,omitempty"`
-	GPU        *GPU      `json:"gpu,omitempty"`
-	App        string    `json:"app"`
-	Capacity   int       `json:"capacity"`
-	PriceInfo  PriceInfo `json:"price_info"`
-	SessionIDs []string  `json:"session_ids,omitempty"`
+	RunnerID string       `json:"runner_id,omitempty"`
+	Version  string       `json:"version,omitempty"`
+	Apps     []appRequest `json:"apps"`
+}
+
+type appRequest struct {
+	AppOptions
+	SessionIDs []string `json:"session_ids,omitempty"`
+}
+
+type appResponse struct {
+	ID         string   `json:"id"`
+	SessionIDs []string `json:"session_ids"`
 }
 
 type heartbeatResponse struct {
-	RunnerID          string   `json:"runner_id"`
-	Orchestrator      string   `json:"orchestrator,omitempty"`
-	HeartbeatInterval string   `json:"heartbeat_interval"`
-	HeartbeatTTL      string   `json:"heartbeat_ttl"`
-	HeartbeatSecret   string   `json:"heartbeat_secret,omitempty"`
-	O2R               *Channel `json:"o2r,omitempty"`
-	SessionIDs        []string `json:"session_ids"`
+	RunnerID          string        `json:"runner_id"`
+	Orchestrator      string        `json:"orchestrator,omitempty"`
+	HeartbeatInterval string        `json:"heartbeat_interval"`
+	HeartbeatTTL      string        `json:"heartbeat_ttl"`
+	HeartbeatSecret   string        `json:"heartbeat_secret,omitempty"`
+	O2R               *Channel      `json:"o2r,omitempty"`
+	Apps              []appResponse `json:"apps"`
 }
 
 func New(opts Options) (*Runner, error) {
@@ -83,33 +76,28 @@ func New(opts Options) (*Runner, error) {
 	if err != nil {
 		return nil, err
 	}
-	mode, err := normalizeMode(opts.Mode)
-	if err != nil {
-		return nil, err
-	}
-	priceInfo, err := normalizePriceInfo(opts.PriceInfo)
-	if err != nil {
-		return nil, err
-	}
 	if strings.TrimSpace(opts.BootstrapSecret) == "" {
 		return nil, errors.New("bootstrap secret is required")
 	}
-	if strings.TrimSpace(opts.RunnerURL) == "" {
-		return nil, errors.New("runner URL is required")
+	if len(opts.Apps) == 0 {
+		return nil, errors.New("at least one app is required")
 	}
-	if strings.TrimSpace(opts.App) == "" {
-		return nil, errors.New("app is required")
-	}
-	capacity := opts.Capacity
-	if capacity <= 0 {
-		capacity = 1
-	}
-	status := opts.Status
-	if status == "" {
-		status = "ready"
+	apps := make([]appRequest, len(opts.Apps))
+	seen := make(map[string]bool, len(apps))
+	for i, appOpts := range opts.Apps {
+		app, err := newAppRequest(appOpts)
+		if err != nil {
+			return nil, fmt.Errorf("app %d: %w", i, err)
+		}
+		if app.ID != "" {
+			if seen[app.ID] {
+				return nil, fmt.Errorf("duplicate app ID %q", app.ID)
+			}
+			seen[app.ID] = true
+		}
+		apps[i] = app
 	}
 	interval := opts.HeartbeatInterval
-	override := interval > 0
 	if interval <= 0 {
 		interval = defaultHeartbeatInterval
 	}
@@ -117,35 +105,50 @@ func New(opts Options) (*Runner, error) {
 	if timeout <= 0 {
 		timeout = defaultTimeout
 	}
-	unregisterOnClose := true
-	if opts.DisableUnregisterOnClose {
-		unregisterOnClose = false
-	}
-	if opts.UnregisterOnClose {
-		unregisterOnClose = true
-	}
 	return &Runner{
 		orchestratorURL:   base,
 		bootstrapSecret:   opts.BootstrapSecret,
-		runnerURL:         opts.RunnerURL,
-		app:               opts.App,
-		metadata:          opts.Metadata,
-		mode:              mode,
-		proxy:             opts.Proxy,
-		capacity:          capacity,
-		status:            status,
 		version:           moduleVersion(),
-		gpu:               opts.GPU,
-		priceInfo:         priceInfo,
 		runnerID:          strings.TrimSpace(opts.RunnerID),
+		apps:              apps,
 		client:            opts.HTTPClient,
 		timeout:           timeout,
 		heartbeatInterval: interval,
-		intervalOverride:  override,
-		unregisterOnClose: unregisterOnClose,
+		intervalOverride:  opts.HeartbeatInterval > 0,
+		unregisterOnClose: opts.UnregisterOnClose || !opts.DisableUnregisterOnClose,
 		onReserve:         opts.OnReserve,
 		onRelease:         opts.OnRelease,
 	}, nil
+}
+
+func newAppRequest(opts AppOptions) (appRequest, error) {
+	var err error
+	opts.Mode, err = normalizeMode(opts.Mode)
+	if err != nil {
+		return appRequest{}, err
+	}
+	opts.PriceInfo, err = normalizePriceInfo(opts.PriceInfo)
+	if err != nil {
+		return appRequest{}, err
+	}
+	if strings.TrimSpace(opts.RunnerURL) == "" {
+		return appRequest{}, errors.New("runner URL is required")
+	}
+	if strings.TrimSpace(opts.App) == "" {
+		return appRequest{}, errors.New("app is required")
+	}
+	if opts.Capacity <= 0 {
+		opts.Capacity = 1
+	}
+	if opts.Status == "" {
+		opts.Status = "ready"
+	}
+	opts.ID = strings.TrimSpace(opts.ID)
+	if opts.GPU != nil {
+		gpu := *opts.GPU
+		opts.GPU = &gpu
+	}
+	return appRequest{AppOptions: opts}, nil
 }
 
 func moduleVersion() string {
@@ -202,20 +205,22 @@ func Register(ctx context.Context, opts Options) (*Runner, error) {
 	return r, nil
 }
 
+// Start may be called only once, even if registration fails.
 func (r *Runner) Start(ctx context.Context) error {
-	if err := r.sendHeartbeat(ctx); err != nil {
-		return err
-	}
 	r.mu.Lock()
-	if r.started || r.closed {
+	if r.heartbeatLoopCancel != nil || r.closed {
 		r.mu.Unlock()
-		return nil
+		return errors.New("runner already started or closed")
 	}
 	loopCtx, cancel := context.WithCancel(context.Background())
 	r.heartbeatLoopCancel = cancel
-	r.started = true
 	r.wg.Add(1)
 	r.mu.Unlock()
+	if err := r.sendHeartbeat(ctx); err != nil {
+		cancel()
+		r.wg.Done()
+		return err
+	}
 	go r.heartbeatLoop(loopCtx)
 	return nil
 }
@@ -227,35 +232,22 @@ func (r *Runner) Close(ctx context.Context) error {
 		return nil
 	}
 	r.closed = true
-	hbCancel := r.heartbeatLoopCancel
-	o2rCancel := r.o2rCancel
-	r.heartbeatLoopCancel = nil
-	r.o2rCancel = nil
+	if r.heartbeatLoopCancel != nil {
+		r.heartbeatLoopCancel()
+	}
+	if r.o2rCancel != nil {
+		r.o2rCancel()
+	}
 	r.mu.Unlock()
-	if hbCancel != nil {
-		hbCancel()
-	}
-	if o2rCancel != nil {
-		o2rCancel()
-	}
 	r.wg.Wait()
-
-	r.mu.Lock()
-	runnerID := r.runnerID
-	secret := r.heartbeatSecret
-	unregister := r.unregisterOnClose
-	base := r.orchestratorURL
-	timeout := r.timeout
-	client := r.client
-	r.mu.Unlock()
-	if !unregister || runnerID == "" || secret == "" {
+	if !r.unregisterOnClose || r.runnerID == "" || r.heartbeatSecret == "" {
 		return nil
 	}
-	url, err := joinEndpoint(base, "/runners/"+url.PathEscape(runnerID)+"/unregister")
+	url, err := joinEndpoint(r.orchestratorURL, "/runners/"+url.PathEscape(r.runnerID)+"/unregister")
 	if err != nil {
 		return err
 	}
-	return postEmpty(ctx, client, url, map[string]string{"Authorization": secret}, timeout)
+	return postEmpty(ctx, r.client, url, map[string]string{"Authorization": r.heartbeatSecret}, r.timeout)
 }
 
 func (r *Runner) RunnerID() string {
@@ -292,10 +284,36 @@ func (r *Runner) O2RChannel() *Channel {
 	return &ch
 }
 
-func (r *Runner) ActiveSessionIDs() []string {
+// AppIDs returns app IDs in Options.Apps order. Omitted IDs are assigned on registration.
+func (r *Runner) AppIDs() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return copyStrings(r.activeSessionIDs)
+	ids := make([]string, len(r.apps))
+	for i, app := range r.apps {
+		ids[i] = app.ID
+	}
+	return ids
+}
+
+// ActiveSessionIDs returns a copy of the sessions tracked for an app.
+func (r *Runner) ActiveSessionIDs(appID string) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if app := r.appLocked(appID); app != nil {
+		return copyStrings(app.SessionIDs)
+	}
+	return nil
+}
+
+func (r *Runner) appLocked(appID string) *appRequest {
+	if appID != "" {
+		for i := range r.apps {
+			if r.apps[i].ID == appID {
+				return &r.apps[i]
+			}
+		}
+	}
+	return nil
 }
 
 func (r *Runner) heartbeatLoop(ctx context.Context) {
@@ -341,8 +359,6 @@ func (r *Runner) sendHeartbeat(ctx context.Context) error {
 func (r *Runner) postHeartbeat(ctx context.Context, auth string) (*heartbeatResponse, error) {
 	r.mu.Lock()
 	base := r.orchestratorURL
-	timeout := r.timeout
-	client := r.client
 	payload := r.payloadLocked()
 	r.mu.Unlock()
 	url, err := joinEndpoint(base, "/runners/heartbeat")
@@ -350,26 +366,22 @@ func (r *Runner) postHeartbeat(ctx context.Context, auth string) (*heartbeatResp
 		return nil, err
 	}
 	var resp heartbeatResponse
-	if err := requestJSON(ctx, client, http.MethodPost, url, payload, map[string]string{"Authorization": auth}, timeout, &resp); err != nil {
+	if err := requestJSON(ctx, r.client, http.MethodPost, url, payload, map[string]string{"Authorization": auth}, r.timeout, &resp); err != nil {
 		return nil, err
 	}
 	return &resp, nil
 }
 
 func (r *Runner) payloadLocked() heartbeatRequest {
+	apps := make([]appRequest, len(r.apps))
+	for i, app := range r.apps {
+		apps[i] = app
+		apps[i].SessionIDs = copyStrings(app.SessionIDs)
+	}
 	return heartbeatRequest{
-		RunnerID:   r.runnerID,
-		RunnerURL:  r.runnerURL,
-		Version:    r.version,
-		Metadata:   r.metadata,
-		Status:     r.status,
-		Mode:       r.mode,
-		Proxy:      r.proxy,
-		GPU:        r.gpu,
-		App:        r.app,
-		Capacity:   r.capacity,
-		PriceInfo:  r.priceInfo,
-		SessionIDs: copyStrings(r.activeSessionIDs),
+		RunnerID: r.runnerID,
+		Version:  r.version,
+		Apps:     apps,
 	}
 }
 
@@ -379,13 +391,34 @@ func (r *Runner) applyHeartbeatResponse(resp *heartbeatResponse, initial bool) e
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.runnerID = strings.TrimSpace(resp.RunnerID)
+	if len(resp.Apps) < len(r.apps) {
+		return errors.New("heartbeat response missing apps")
+	}
+	seen := make(map[string]bool, len(resp.Apps))
+	for i, app := range resp.Apps {
+		if strings.TrimSpace(app.ID) == "" || seen[app.ID] {
+			return errors.New("heartbeat response contains missing or duplicate app IDs")
+		}
+		seen[app.ID] = true
+		if i < len(r.apps) && r.apps[i].ID != "" && r.apps[i].ID != app.ID {
+			return fmt.Errorf("heartbeat response changed app ID %q", r.apps[i].ID)
+		}
+	}
+	base := r.orchestratorURL
 	if strings.TrimSpace(resp.Orchestrator) != "" {
-		base, err := normalizeBase(resp.Orchestrator)
+		var err error
+		base, err = normalizeBase(resp.Orchestrator)
 		if err != nil {
 			return err
 		}
-		r.orchestratorURL = base
+	}
+	if initial && strings.TrimSpace(resp.HeartbeatSecret) == "" {
+		return errors.New("heartbeat response missing heartbeat_secret")
+	}
+	r.runnerID = strings.TrimSpace(resp.RunnerID)
+	r.orchestratorURL = base
+	for i := range r.apps {
+		r.apps[i].ID = resp.Apps[i].ID
 	}
 	if !r.intervalOverride {
 		r.heartbeatInterval = parseGoDuration(resp.HeartbeatInterval, defaultHeartbeatInterval)
@@ -393,10 +426,11 @@ func (r *Runner) applyHeartbeatResponse(resp *heartbeatResponse, initial bool) e
 	r.heartbeatTTL = parseGoDuration(resp.HeartbeatTTL, 0)
 	if strings.TrimSpace(resp.HeartbeatSecret) != "" {
 		r.heartbeatSecret = strings.TrimSpace(resp.HeartbeatSecret)
-	} else if initial {
-		return errors.New("heartbeat response missing heartbeat_secret")
 	}
-	if initial && resp.O2R != nil && strings.TrimSpace(resp.O2R.URL) != "" && r.o2r == nil && !r.closed {
+	if resp.O2R != nil && strings.TrimSpace(resp.O2R.URL) != "" && !r.closed && (r.o2r == nil || r.o2r.URL != resp.O2R.URL) {
+		if r.o2rCancel != nil {
+			r.o2rCancel()
+		}
 		ch := *resp.O2R
 		r.o2r = &ch
 		o2rCtx, cancel := context.WithCancel(context.Background())
@@ -427,44 +461,50 @@ func (r *Runner) readO2R(ctx context.Context, channelURL string) {
 		if msg == nil {
 			return
 		}
-		r.HandleO2RMessage(msg)
+		r.handleO2RMessage(ctx, msg)
 	}
 }
 
 func (r *Runner) HandleO2RMessage(message map[string]any) {
+	r.handleO2RMessage(context.Background(), message)
+}
+
+func (r *Runner) handleO2RMessage(ctx context.Context, message map[string]any) {
 	if message == nil || message["keep"] == "alive" {
 		return
 	}
 	event, _ := message["event"].(string)
 	sessionID, _ := message["session"].(string)
 	sessionID = strings.TrimSpace(sessionID)
+	appID, _ := message["app_id"].(string)
+	appID = strings.TrimSpace(appID)
 	if (event != "reserved" && event != "released") || sessionID == "" {
 		slog.Warn("ignoring unknown live runner O2R message", "message", message)
 		return
 	}
 	timestamp, _ := message["timestamp"].(string)
 	token, _ := message["session_token"].(string)
-	ev := SessionEvent{SessionID: sessionID, SessionToken: token, Event: event, Timestamp: timestamp, Raw: message}
+	ev := SessionEvent{AppID: appID, SessionID: sessionID, SessionToken: token, Event: event, Timestamp: timestamp, Raw: message}
 	var cb Callback
 	r.mu.Lock()
+	if ctx.Err() != nil || r.closed {
+		r.mu.Unlock()
+		return
+	}
+	app := r.appLocked(appID)
+	if app == nil {
+		r.mu.Unlock()
+		slog.Warn("ignoring live runner O2R message for unknown app", "app_id", appID)
+		return
+	}
 	if event == "reserved" {
-		exists := false
-		for _, id := range r.activeSessionIDs {
-			if id == sessionID {
-				exists = true
-				break
-			}
-		}
-		if !exists {
-			r.activeSessionIDs = append(r.activeSessionIDs, sessionID)
+		if !slices.Contains(app.SessionIDs, sessionID) {
+			app.SessionIDs = append(app.SessionIDs, sessionID)
 		}
 		cb = r.onReserve
 	} else {
-		for i, id := range r.activeSessionIDs {
-			if id == sessionID {
-				r.activeSessionIDs = append(r.activeSessionIDs[:i], r.activeSessionIDs[i+1:]...)
-				break
-			}
+		if i := slices.Index(app.SessionIDs, sessionID); i >= 0 {
+			app.SessionIDs = slices.Delete(app.SessionIDs, i, i+1)
 		}
 		cb = r.onRelease
 	}

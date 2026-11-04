@@ -87,10 +87,12 @@ func run(ctx context.Context, cfg config, logger *slog.Logger) error {
 		runner, err = liverunner.Register(ctx, liverunner.Options{
 			OrchestratorURL: cfg.orchestratorURL,
 			BootstrapSecret: cfg.bootstrapSecret,
-			RunnerURL:       cfg.runnerURL,
-			App:             cfg.app,
-			Mode:            cfg.mode,
-			Capacity:        cfg.capacity,
+			Apps: []liverunner.AppOptions{{
+				RunnerURL: cfg.runnerURL,
+				App:       cfg.app,
+				Mode:      cfg.mode,
+				Capacity:  cfg.capacity,
+			}},
 		})
 		if err != nil {
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

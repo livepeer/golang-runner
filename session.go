@@ -34,7 +34,7 @@ func sessionControlEndpoint(req *http.Request, suffix string) (string, error) {
 	return joinEndpoint(controlURL, suffix)
 }
 
-func sessionEndpoint(orchestratorURL, runnerID string, req *http.Request, suffix string) (string, string, error) {
+func sessionEndpoint(orchestratorURL string, req *http.Request, suffix string) (string, string, error) {
 	if req == nil {
 		return "", "", errors.New("request is required")
 	}
@@ -50,20 +50,22 @@ func sessionEndpoint(orchestratorURL, runnerID string, req *http.Request, suffix
 	if sessionID == "" {
 		return "", "", errors.New("session_id is required")
 	}
-	if runnerID == "" {
-		runnerID = strings.TrimSpace(req.Header.Get(HeaderRunnerRoute))
-	}
-	if runnerID == "" {
-		return "", "", errors.New("runner_id is required")
+	appID := strings.TrimSpace(req.Header.Get(HeaderRunnerRoute))
+	if appID == "" {
+		return "", "", errors.New("app_id is required")
 	}
 	if !strings.HasPrefix(suffix, "/") {
 		suffix = "/" + suffix
 	}
-	endpoint, err := joinEndpoint(orchestratorURL, "/runner/"+url.PathEscape(runnerID)+"/session/"+url.PathEscape(sessionID)+suffix)
+	endpoint, err := joinEndpoint(orchestratorURL, "/runner/"+url.PathEscape(appID)+"/session/"+url.PathEscape(sessionID)+suffix)
 	return endpoint, token, err
 }
 
-func (r *Runner) StopSession(ctx context.Context, sessionID, sessionToken string) error {
+func (r *Runner) StopSession(ctx context.Context, appID, sessionID, sessionToken string) error {
+	appID = strings.TrimSpace(appID)
+	if appID == "" {
+		return errors.New("app_id is required")
+	}
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
 		return errors.New("session_id is required")
@@ -73,12 +75,9 @@ func (r *Runner) StopSession(ctx context.Context, sessionID, sessionToken string
 		return errors.New("session_token is required")
 	}
 	r.mu.Lock()
-	base, runnerID, client, timeout := r.orchestratorURL, r.runnerID, r.client, r.timeout
+	base, client, timeout := r.orchestratorURL, r.client, r.timeout
 	r.mu.Unlock()
-	if runnerID == "" {
-		return errors.New("runner_id is required")
-	}
-	endpoint, err := url.JoinPath(base, "runner", url.PathEscape(runnerID), "session", url.PathEscape(sessionID), "stop")
+	endpoint, err := url.JoinPath(base, "runner", url.PathEscape(appID), "session", url.PathEscape(sessionID), "stop")
 	if err != nil {
 		return err
 	}

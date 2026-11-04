@@ -24,20 +24,20 @@ type deleteChannelsResponse struct {
 }
 
 func (r *Runner) CreateTrickleChannels(ctx context.Context, req *http.Request, channels []ChannelRequest) ([]Channel, error) {
-	return CreateTrickleChannels(ctx, r.client, r.OrchestratorURL(), r.RunnerID(), req, channels)
+	return CreateTrickleChannels(ctx, r.client, r.OrchestratorURL(), req, channels)
 }
 
 func (r *Runner) DeleteTrickleChannels(ctx context.Context, req *http.Request, channels []string) ([]string, error) {
-	return DeleteTrickleChannels(ctx, r.client, r.OrchestratorURL(), r.RunnerID(), req, channels)
+	return DeleteTrickleChannels(ctx, r.client, r.OrchestratorURL(), req, channels)
 }
 
-func CreateTrickleChannels(ctx context.Context, client HTTPDoer, orchestratorURL, runnerID string, req *http.Request, channels []ChannelRequest) ([]Channel, error) {
+func CreateTrickleChannels(ctx context.Context, client HTTPDoer, orchestratorURL string, req *http.Request, channels []ChannelRequest) ([]Channel, error) {
 	for _, ch := range channels {
 		if strings.TrimSpace(ch.Name) == "" || strings.TrimSpace(ch.MimeType) == "" {
 			return nil, errors.New("trickle channel name and mime_type are required")
 		}
 	}
-	endpoint, token, err := channelsEndpoint(orchestratorURL, runnerID, req)
+	endpoint, token, err := sessionEndpoint(orchestratorURL, req, "channels")
 	if err != nil {
 		return nil, err
 	}
@@ -51,8 +51,8 @@ func CreateTrickleChannels(ctx context.Context, client HTTPDoer, orchestratorURL
 	return resp.Channels, nil
 }
 
-func DeleteTrickleChannels(ctx context.Context, client HTTPDoer, orchestratorURL, runnerID string, req *http.Request, channels []string) ([]string, error) {
-	endpoint, token, err := channelsEndpoint(orchestratorURL, runnerID, req)
+func DeleteTrickleChannels(ctx context.Context, client HTTPDoer, orchestratorURL string, req *http.Request, channels []string) ([]string, error) {
+	endpoint, token, err := sessionEndpoint(orchestratorURL, req, "channels")
 	if err != nil {
 		return nil, err
 	}
@@ -64,8 +64,4 @@ func DeleteTrickleChannels(ctx context.Context, client HTTPDoer, orchestratorURL
 		return nil, errors.New("trickle channel delete response missing deleted")
 	}
 	return resp.Deleted, nil
-}
-
-func channelsEndpoint(orchestratorURL, runnerID string, req *http.Request) (string, string, error) {
-	return sessionEndpoint(orchestratorURL, runnerID, req, "channels")
 }
