@@ -5,15 +5,9 @@ on:
     branches: [main]
   push:
     branches: [main]
-  merge_group:
-  workflow_call:
 
 permissions:
   contents: read
-
-concurrency:
-  group: go-ci-${{ github.event_name == 'push' && github.run_id || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
@@ -37,14 +31,3 @@ jobs:
         run: go vet ./...
       - name: Build the SDK and examples
         run: go build ./...
-  ci-gate:
-    name: ci-gate
-    if: always()
-    needs: [test]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - name: Require Go CI to succeed
-        env:
-          TEST_RESULT: ${{ needs.test.result }}
-        run: test "$TEST_RESULT" = success
