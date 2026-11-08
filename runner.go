@@ -108,6 +108,7 @@ func New(opts Options) (*Runner, error) {
 	return &Runner{
 		orchestratorURL:   base,
 		bootstrapSecret:   opts.BootstrapSecret,
+		heartbeatSecret:   opts.HeartbeatSecret,
 		version:           moduleVersion(),
 		runnerID:          strings.TrimSpace(opts.RunnerID),
 		apps:              apps,
@@ -254,6 +255,13 @@ func (r *Runner) RunnerID() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.runnerID
+}
+
+// Runner credential; treat this as sensitive
+func (r *Runner) HeartbeatSecret() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.heartbeatSecret
 }
 
 func (r *Runner) OrchestratorURL() string {
