@@ -123,6 +123,7 @@ type AppOptions struct {
 
 type Options struct {
 	OrchestratorURL string
+	AllowedOrigins  []string
 	BootstrapSecret string
 	HeartbeatSecret string
 	RunnerID        string

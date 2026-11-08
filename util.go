@@ -4,7 +4,6 @@ import (
 	"errors"
 	"net/url"
 	"strings"
-	"time"
 )
 
 func normalizeBase(raw string) (string, error) {
@@ -47,17 +46,6 @@ func normalizeMode(mode string) (string, error) {
 		return "", errors.New("live runner mode must be persistent or single-shot")
 	}
 	return mode, nil
-}
-
-func parseGoDuration(value string, fallback time.Duration) time.Duration {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return fallback
-	}
-	if d, err := time.ParseDuration(value); err == nil {
-		return d
-	}
-	return fallback
 }
 
 func copyStrings(values []string) []string {
