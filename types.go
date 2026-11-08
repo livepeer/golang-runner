@@ -124,6 +124,7 @@ type AppOptions struct {
 type Options struct {
 	OrchestratorURL string
 	BootstrapSecret string
+	HeartbeatSecret string
 	RunnerID        string
 	Apps            []AppOptions
 
