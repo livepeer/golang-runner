@@ -135,6 +135,53 @@ type Options struct {
 	DisableUnregisterOnClose bool
 	OnReserve                Callback
 	OnRelease                Callback
+	OnHeartbeat              func(HeartbeatEvent)
+	InitialSeq               uint64
+}
+
+// HeartbeatApp is an app sent in a heartbeat.
+type HeartbeatApp struct {
+	AppOptions
+	SessionIDs []string `json:"session_ids,omitempty"`
+}
+
+type HeartbeatRequest struct {
+	RunnerID string         `json:"runner_id,omitempty"`
+	Version  string         `json:"version,omitempty"`
+	Seq      uint64         `json:"seq"`
+	Apps     []HeartbeatApp `json:"apps"`
+}
+
+type HeartbeatAppStatus struct {
+	ID         string   `json:"id"`
+	Status     string   `json:"status"`
+	SessionIDs []string `json:"session_ids"`
+}
+
+// HeartbeatResponse contains Node's complete app list, including draining apps.
+type HeartbeatResponse struct {
+	RunnerID          string               `json:"runner_id"`
+	Orchestrator      string               `json:"orchestrator,omitempty"`
+	HeartbeatInterval string               `json:"heartbeat_interval"`
+	HeartbeatTTL      string               `json:"heartbeat_ttl"`
+	HeartbeatSecret   string               `json:"heartbeat_secret,omitempty"`
+	Seq               *uint64              `json:"seq,omitempty"`
+	O2R               *Channel             `json:"o2r,omitempty"`
+	Apps              []HeartbeatAppStatus `json:"apps"`
+}
+
+// HeartbeatEvent contains the request and result of one heartbeat.
+// Changing its data does not change the Runner. Response is nil if the request
+// failed or the response was invalid. Credential is the secret sent with the
+// request. At is the request start time; TTL is from the response.
+type HeartbeatEvent struct {
+	Request     HeartbeatRequest
+	Response    *HeartbeatResponse
+	Credential  string
+	AcceptedSeq *uint64
+	At          time.Time
+	TTL         time.Duration
+	Err         error
 }
 
 type HTTPDoer interface {
