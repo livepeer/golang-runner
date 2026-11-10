@@ -94,8 +94,6 @@ func TestRunnerAppValidation(t *testing.T) {
 		apps []AppOptions
 		want string
 	}{
-		{"no apps", nil, "at least one app"},
-		{"empty apps", []AppOptions{}, "at least one app"},
 		{"missing app", []AppOptions{valid, {RunnerURL: valid.RunnerURL}}, "app 1: app is required"},
 		{"missing URL", []AppOptions{valid, {App: valid.App}}, "app 1: runner URL is required"},
 		{"invalid mode", []AppOptions{valid, {App: valid.App, RunnerURL: valid.RunnerURL, Mode: "single_shot"}}, "app 1: live runner mode"},
@@ -208,12 +206,12 @@ func TestRunnerRegistrationHeartbeatO2RAndUnregister(t *testing.T) {
 
 	var mu sync.Mutex
 	var heartbeatAuth []string
-	var payloads []heartbeatRequest
+	var payloads []HeartbeatRequest
 	var unregistered bool
 	orch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/api/runners/heartbeat":
-			var payload heartbeatRequest
+			var payload HeartbeatRequest
 			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 				t.Errorf("decode payload: %v", err)
 				w.WriteHeader(http.StatusBadRequest)
@@ -223,13 +221,13 @@ func TestRunnerRegistrationHeartbeatO2RAndUnregister(t *testing.T) {
 			heartbeatAuth = append(heartbeatAuth, r.Header.Get("Authorization"))
 			payloads = append(payloads, payload)
 			mu.Unlock()
-			json.NewEncoder(w).Encode(heartbeatResponse{
+			json.NewEncoder(w).Encode(HeartbeatResponse{
 				RunnerID:          "runner-1",
 				Orchestrator:      "http://" + r.Host + "/api",
 				HeartbeatInterval: "50ms",
 				HeartbeatTTL:      "250ms",
 				HeartbeatSecret:   "heartbeat-secret",
-				Apps:              []appResponse{{ID: "echo"}},
+				Apps:              []HeartbeatAppStatus{{ID: "echo"}},
 				O2R: &Channel{
 					Name:        "o2r",
 					ChannelName: "runner-1-o2r",
@@ -348,7 +346,7 @@ func TestRunnerRegistrationHeartbeatO2RAndUnregister(t *testing.T) {
 func TestRunnerMultiAppHeartbeatsAndSessions(t *testing.T) {
 	ctx := context.Background()
 	var mu sync.Mutex
-	var payloads []heartbeatRequest
+	var payloads []HeartbeatRequest
 	var auth []string
 	var unregisters int
 	var runner *Runner
@@ -374,7 +372,7 @@ func TestRunnerMultiAppHeartbeatsAndSessions(t *testing.T) {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		if len(fields) != 3 || fields["runner_id"] == nil || fields["version"] == nil || fields["apps"] == nil {
+		if len(fields) != 4 || fields["runner_id"] == nil || fields["version"] == nil || fields["apps"] == nil || fields["seq"] == nil {
 			t.Errorf("heartbeat top-level fields = %v", fields)
 		}
 		var rawApps []map[string]json.RawMessage
@@ -387,7 +385,7 @@ func TestRunnerMultiAppHeartbeatsAndSessions(t *testing.T) {
 			t.Errorf("empty metadata and disabled proxy should be omitted: %s", fields["apps"])
 		}
 		data, _ := json.Marshal(fields)
-		var payload heartbeatRequest
+		var payload HeartbeatRequest
 		if err := json.Unmarshal(data, &payload); err != nil {
 			t.Error(err)
 		}
@@ -408,9 +406,9 @@ func TestRunnerMultiAppHeartbeatsAndSessions(t *testing.T) {
 			// An event arriving during the heartbeat must survive its stale response.
 			runner.HandleO2RMessage(map[string]any{"event": "reserved", "app_id": "generated", "session": "new"})
 		}
-		json.NewEncoder(w).Encode(heartbeatResponse{
+		json.NewEncoder(w).Encode(HeartbeatResponse{
 			RunnerID: "owner", HeartbeatSecret: secret,
-			Apps: []appResponse{{ID: "explicit", SessionIDs: []string{"stale"}}, {ID: "generated"}},
+			Apps: []HeartbeatAppStatus{{ID: "explicit", SessionIDs: []string{"stale"}}, {ID: "generated"}},
 		})
 	}))
 	defer orch.Close()
@@ -538,7 +536,6 @@ func TestHeartbeatRejectsInvalidAppResponsesAtomically(t *testing.T) {
 		{"empty ID", `{"runner_id":"owner","heartbeat_secret":"secret","apps":[{"id":"generated"},{"id":" "}]}`},
 		{"duplicate ID", `{"runner_id":"owner","heartbeat_secret":"secret","apps":[{"id":"explicit"},{"id":"explicit"}]}`},
 		{"changed explicit ID", `{"runner_id":"owner","heartbeat_secret":"secret","apps":[{"id":"generated"},{"id":"changed"}]}`},
-		{"missing secret", `{"runner_id":"owner","apps":[{"id":"generated"},{"id":"explicit"}]}`},
 		{"invalid orchestrator", `{"runner_id":"owner","heartbeat_secret":"secret","orchestrator":"file:///bad","apps":[{"id":"generated"},{"id":"explicit"}]}`},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -576,7 +573,7 @@ func TestRunnerCloseWaitsForStartup(t *testing.T) {
 		mu.Unlock()
 		if req.URL.Path == "/runners/heartbeat" {
 			<-release
-			json.NewEncoder(w).Encode(heartbeatResponse{RunnerID: "owner", HeartbeatSecret: "secret", Apps: []appResponse{{ID: "generated"}}})
+			json.NewEncoder(w).Encode(HeartbeatResponse{RunnerID: "owner", HeartbeatSecret: "secret", Apps: []HeartbeatAppStatus{{ID: "generated"}}})
 			return
 		}
 		if req.URL.Path != "/runners/owner/unregister" || req.Header.Get("Authorization") != "secret" {
@@ -639,8 +636,8 @@ func TestRunnerReplacesO2RChannel(t *testing.T) {
 	orch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
-		json.NewEncoder(w).Encode(heartbeatResponse{
-			RunnerID: "owner", HeartbeatSecret: "secret", Apps: []appResponse{{ID: "a"}, {ID: "b"}},
+		json.NewEncoder(w).Encode(HeartbeatResponse{
+			RunnerID: "owner", HeartbeatSecret: "secret", Apps: []HeartbeatAppStatus{{ID: "a"}, {ID: "b"}},
 			O2R: &Channel{URL: trickle.URL(channel)},
 		})
 	}))

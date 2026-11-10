@@ -41,8 +41,11 @@ func requestJSON(ctx context.Context, c HTTPDoer, method, url string, payload an
 		return err
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 400 {
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return &HTTPError{StatusCode: resp.StatusCode, URL: url, Body: string(data)}
 	}
 	if out == nil || len(data) == 0 {

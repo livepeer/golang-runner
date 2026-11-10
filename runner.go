@@ -2,6 +2,7 @@ package liverunner
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -28,7 +29,8 @@ type Runner struct {
 	heartbeatSecret string
 	version         string
 	runnerID        string
-	apps            []appRequest
+	apps            []HeartbeatApp
+	sessions        map[string][]string
 
 	client              HTTPDoer
 	timeout             time.Duration
@@ -38,37 +40,13 @@ type Runner struct {
 	unregisterOnClose   bool
 	onReserve           Callback
 	onRelease           Callback
+	onHeartbeat         func(HeartbeatEvent)
+	seq                 uint64
 	o2r                 *Channel
 	o2rCancel           context.CancelFunc
 	closed              bool
 	heartbeatLoopCancel context.CancelFunc
 	wg                  sync.WaitGroup
-}
-
-type heartbeatRequest struct {
-	RunnerID string       `json:"runner_id,omitempty"`
-	Version  string       `json:"version,omitempty"`
-	Apps     []appRequest `json:"apps"`
-}
-
-type appRequest struct {
-	AppOptions
-	SessionIDs []string `json:"session_ids,omitempty"`
-}
-
-type appResponse struct {
-	ID         string   `json:"id"`
-	SessionIDs []string `json:"session_ids"`
-}
-
-type heartbeatResponse struct {
-	RunnerID          string        `json:"runner_id"`
-	Orchestrator      string        `json:"orchestrator,omitempty"`
-	HeartbeatInterval string        `json:"heartbeat_interval"`
-	HeartbeatTTL      string        `json:"heartbeat_ttl"`
-	HeartbeatSecret   string        `json:"heartbeat_secret,omitempty"`
-	O2R               *Channel      `json:"o2r,omitempty"`
-	Apps              []appResponse `json:"apps"`
 }
 
 func New(opts Options) (*Runner, error) {
@@ -79,23 +57,15 @@ func New(opts Options) (*Runner, error) {
 	if strings.TrimSpace(opts.BootstrapSecret) == "" {
 		return nil, errors.New("bootstrap secret is required")
 	}
-	if len(opts.Apps) == 0 {
-		return nil, errors.New("at least one app is required")
+	apps, err := newAppRequests(opts.Apps)
+	if err != nil {
+		return nil, err
 	}
-	apps := make([]appRequest, len(opts.Apps))
-	seen := make(map[string]bool, len(apps))
-	for i, appOpts := range opts.Apps {
-		app, err := newAppRequest(appOpts)
-		if err != nil {
-			return nil, fmt.Errorf("app %d: %w", i, err)
-		}
+	sessions := make(map[string][]string)
+	for _, app := range apps {
 		if app.ID != "" {
-			if seen[app.ID] {
-				return nil, fmt.Errorf("duplicate app ID %q", app.ID)
-			}
-			seen[app.ID] = true
+			sessions[app.ID] = nil
 		}
-		apps[i] = app
 	}
 	interval := opts.HeartbeatInterval
 	if interval <= 0 {
@@ -106,6 +76,9 @@ func New(opts Options) (*Runner, error) {
 		timeout = defaultTimeout
 	}
 	return &Runner{
+		sessions:          sessions,
+		onHeartbeat:       opts.OnHeartbeat,
+		seq:               opts.InitialSeq,
 		orchestratorURL:   base,
 		bootstrapSecret:   opts.BootstrapSecret,
 		heartbeatSecret:   opts.HeartbeatSecret,
@@ -122,21 +95,60 @@ func New(opts Options) (*Runner, error) {
 	}, nil
 }
 
-func newAppRequest(opts AppOptions) (appRequest, error) {
+func newAppRequests(opts []AppOptions) ([]HeartbeatApp, error) {
+	apps := make([]HeartbeatApp, len(opts))
+	seen := make(map[string]bool, len(apps))
+	for i, options := range opts {
+		app, err := newAppRequest(options)
+		if err != nil {
+			return nil, fmt.Errorf("app %d: %w", i, err)
+		}
+		if app.ID != "" && seen[app.ID] {
+			return nil, fmt.Errorf("duplicate app ID %q", app.ID)
+		}
+		seen[app.ID] = true
+		apps[i] = app
+	}
+	return apps, nil
+}
+
+// SetApps replaces the apps reported in future heartbeats.
+func (r *Runner) SetApps(opts []AppOptions) error {
+	apps, err := newAppRequests(opts)
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return errors.New("runner closed")
+	}
+	r.apps = apps
+	for _, app := range apps {
+		if app.ID != "" {
+			if _, exists := r.sessions[app.ID]; !exists {
+				r.sessions[app.ID] = nil
+			}
+		}
+	}
+	return nil
+}
+
+func newAppRequest(opts AppOptions) (HeartbeatApp, error) {
 	var err error
 	opts.Mode, err = normalizeMode(opts.Mode)
 	if err != nil {
-		return appRequest{}, err
+		return HeartbeatApp{}, err
 	}
 	opts.PriceInfo, err = normalizePriceInfo(opts.PriceInfo)
 	if err != nil {
-		return appRequest{}, err
+		return HeartbeatApp{}, err
 	}
 	if strings.TrimSpace(opts.RunnerURL) == "" {
-		return appRequest{}, errors.New("runner URL is required")
+		return HeartbeatApp{}, errors.New("runner URL is required")
 	}
 	if strings.TrimSpace(opts.App) == "" {
-		return appRequest{}, errors.New("app is required")
+		return HeartbeatApp{}, errors.New("app is required")
 	}
 	if opts.Capacity <= 0 {
 		opts.Capacity = 1
@@ -149,7 +161,7 @@ func newAppRequest(opts AppOptions) (appRequest, error) {
 		gpu := *opts.GPU
 		opts.GPU = &gpu
 	}
-	return appRequest{AppOptions: opts}, nil
+	return HeartbeatApp{AppOptions: opts}, nil
 }
 
 func moduleVersion() string {
@@ -226,29 +238,42 @@ func (r *Runner) Start(ctx context.Context) error {
 	return nil
 }
 
+// Close stops the heartbeat and unregisters the runner.
 func (r *Runner) Close(ctx context.Context) error {
 	r.mu.Lock()
-	if r.closed {
-		r.mu.Unlock()
-		return nil
-	}
-	r.closed = true
-	if r.heartbeatLoopCancel != nil {
-		r.heartbeatLoopCancel()
-	}
-	if r.o2rCancel != nil {
-		r.o2rCancel()
+	if !r.closed {
+		r.closed = true
+		if r.heartbeatLoopCancel != nil {
+			r.heartbeatLoopCancel()
+		}
+		if r.o2rCancel != nil {
+			r.o2rCancel()
+		}
 	}
 	r.mu.Unlock()
 	r.wg.Wait()
-	if !r.unregisterOnClose || r.runnerID == "" || r.heartbeatSecret == "" {
+	r.mu.Lock()
+	base, id, secret := r.orchestratorURL, r.runnerID, r.heartbeatSecret
+	unregister := r.unregisterOnClose
+	r.mu.Unlock()
+	if !unregister || id == "" || secret == "" {
 		return nil
 	}
-	url, err := joinEndpoint(r.orchestratorURL, "/runners/"+url.PathEscape(r.runnerID)+"/unregister")
+	endpoint, err := joinEndpoint(base, "/runners/"+url.PathEscape(id)+"/unregister")
 	if err != nil {
 		return err
 	}
-	return postEmpty(ctx, r.client, url, map[string]string{"Authorization": r.heartbeatSecret}, r.timeout)
+	err = postEmpty(ctx, r.client, endpoint, map[string]string{"Authorization": secret}, r.timeout)
+	var httpErr *HTTPError
+	if errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound {
+		err = nil
+	}
+	if err == nil {
+		r.mu.Lock()
+		r.unregisterOnClose = false
+		r.mu.Unlock()
+	}
+	return err
 }
 
 func (r *Runner) RunnerID() string {
@@ -292,7 +317,8 @@ func (r *Runner) O2RChannel() *Channel {
 	return &ch
 }
 
-// AppIDs returns app IDs in Options.Apps order. Omitted IDs are assigned on registration.
+// AppIDs returns IDs in the order supplied to SetApps or Options.Apps.
+// Omitted IDs are assigned on registration; retained draining apps are excluded.
 func (r *Runner) AppIDs() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -307,21 +333,7 @@ func (r *Runner) AppIDs() []string {
 func (r *Runner) ActiveSessionIDs(appID string) []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if app := r.appLocked(appID); app != nil {
-		return copyStrings(app.SessionIDs)
-	}
-	return nil
-}
-
-func (r *Runner) appLocked(appID string) *appRequest {
-	if appID != "" {
-		for i := range r.apps {
-			if r.apps[i].ID == appID {
-				return &r.apps[i]
-			}
-		}
-	}
-	return nil
+	return copyStrings(r.sessions[appID])
 }
 
 func (r *Runner) heartbeatLoop(ctx context.Context) {
@@ -342,64 +354,101 @@ func (r *Runner) heartbeatLoop(ctx context.Context) {
 }
 
 func (r *Runner) sendHeartbeat(ctx context.Context) error {
-	r.mu.Lock()
-	initial := r.heartbeatSecret == ""
-	auth := r.heartbeatSecret
-	if auth == "" {
-		auth = r.bootstrapSecret
-	}
-	r.mu.Unlock()
-	data, err := r.postHeartbeat(ctx, auth)
-	var httpErr *HTTPError
-	if err != nil && !initial && errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusUnauthorized {
-		r.mu.Lock()
-		r.heartbeatSecret = ""
-		r.mu.Unlock()
-		initial = true
-		data, err = r.postHeartbeat(ctx, r.bootstrapSecret)
-	}
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return r.applyHeartbeatResponse(data, initial)
+	// Each cycle allows one authentication fallback and one sequence retry.
+	fallback, catchup := false, false
+	for {
+		r.mu.Lock()
+		if r.closed {
+			r.mu.Unlock()
+			return errors.New("runner closed")
+		}
+		auth := r.heartbeatSecret
+		if auth == "" {
+			auth = r.bootstrapSecret
+		}
+		payload := r.payloadLocked()
+		apps := r.apps
+		payload.Seq = r.seq
+		r.seq++
+		base := r.orchestratorURL
+		r.mu.Unlock()
+
+		at := time.Now()
+		endpoint, err := joinEndpoint(base, "/runners/heartbeat")
+		var resp HeartbeatResponse
+		if err == nil {
+			err = requestJSON(ctx, r.client, http.MethodPost, endpoint, payload, map[string]string{"Authorization": auth}, r.timeout, &resp)
+		}
+		if err == nil {
+			err = r.applyHeartbeatResponse(&resp, payload, apps, auth)
+		}
+		event := HeartbeatEvent{Request: payload, Credential: auth, At: at, Err: err}
+		var httpErr *HTTPError
+		retry := false
+		if errors.As(err, &httpErr) {
+			if httpErr.StatusCode == http.StatusUnauthorized && !fallback && auth != r.bootstrapSecret {
+				fallback = true
+				r.mu.Lock()
+				r.heartbeatSecret = ""
+				r.seq = 0
+				r.mu.Unlock()
+				retry = true
+			}
+			if httpErr.StatusCode == http.StatusConflict {
+				var conflict struct {
+					Seq *uint64 `json:"seq"`
+				}
+				if json.Unmarshal([]byte(httpErr.Body), &conflict) == nil && conflict.Seq != nil {
+					event.AcceptedSeq = copySeq(conflict.Seq)
+					r.mu.Lock()
+					if r.seq <= *conflict.Seq {
+						r.seq = *conflict.Seq + 1
+					}
+					retry = !catchup
+					r.mu.Unlock()
+					catchup = true
+				}
+			}
+		}
+		if err == nil {
+			event.Response = &resp
+			event.AcceptedSeq = copySeq(resp.Seq)
+			event.TTL = parseGoDuration(resp.HeartbeatTTL, 0)
+		}
+		if r.onHeartbeat != nil {
+			r.onHeartbeat(event)
+		}
+		if !retry || ctx.Err() != nil {
+			return err
+		}
+	}
 }
 
-func (r *Runner) postHeartbeat(ctx context.Context, auth string) (*heartbeatResponse, error) {
-	r.mu.Lock()
-	base := r.orchestratorURL
-	payload := r.payloadLocked()
-	r.mu.Unlock()
-	url, err := joinEndpoint(base, "/runners/heartbeat")
-	if err != nil {
-		return nil, err
-	}
-	var resp heartbeatResponse
-	if err := requestJSON(ctx, r.client, http.MethodPost, url, payload, map[string]string{"Authorization": auth}, r.timeout, &resp); err != nil {
-		return nil, err
-	}
-	return &resp, nil
-}
-
-func (r *Runner) payloadLocked() heartbeatRequest {
-	apps := make([]appRequest, len(r.apps))
+func (r *Runner) payloadLocked() HeartbeatRequest {
+	apps := make([]HeartbeatApp, len(r.apps))
 	for i, app := range r.apps {
 		apps[i] = app
-		apps[i].SessionIDs = copyStrings(app.SessionIDs)
+		apps[i].SessionIDs = copyStrings(r.sessions[app.ID])
+		if app.GPU != nil {
+			gpu := *app.GPU
+			apps[i].GPU = &gpu
+		}
 	}
-	return heartbeatRequest{
-		RunnerID: r.runnerID,
-		Version:  r.version,
-		Apps:     apps,
-	}
+	return HeartbeatRequest{RunnerID: r.runnerID, Version: r.version, Apps: apps}
 }
 
-func (r *Runner) applyHeartbeatResponse(resp *heartbeatResponse, initial bool) error {
-	if resp == nil || strings.TrimSpace(resp.RunnerID) == "" {
+func (r *Runner) applyHeartbeatResponse(resp *HeartbeatResponse, req HeartbeatRequest, apps []HeartbeatApp, auth string) error {
+	if strings.TrimSpace(resp.RunnerID) == "" {
 		return errors.New("heartbeat response missing runner_id")
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if len(resp.Apps) < len(r.apps) {
+	if req.RunnerID != "" && req.RunnerID != resp.RunnerID {
+		return errors.New("heartbeat response changed runner_id")
+	}
+	// A missing or null array does not confirm that all apps were removed.
+	if resp.Apps == nil || len(resp.Apps) < len(req.Apps) {
 		return errors.New("heartbeat response missing apps")
 	}
 	seen := make(map[string]bool, len(resp.Apps))
@@ -408,10 +457,16 @@ func (r *Runner) applyHeartbeatResponse(resp *heartbeatResponse, initial bool) e
 			return errors.New("heartbeat response contains missing or duplicate app IDs")
 		}
 		seen[app.ID] = true
-		if i < len(r.apps) && r.apps[i].ID != "" && r.apps[i].ID != app.ID {
-			return fmt.Errorf("heartbeat response changed app ID %q", r.apps[i].ID)
+		if i < len(req.Apps) && req.Apps[i].ID != "" && req.Apps[i].ID != app.ID {
+			return fmt.Errorf("heartbeat response changed app ID %q", req.Apps[i].ID)
 		}
 	}
+	issued := strings.TrimSpace(resp.HeartbeatSecret)
+	if resp.Seq != nil && *resp.Seq != req.Seq {
+		return errors.New("heartbeat response did not echo submitted seq")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	base := r.orchestratorURL
 	if strings.TrimSpace(resp.Orchestrator) != "" {
 		var err error
@@ -420,20 +475,38 @@ func (r *Runner) applyHeartbeatResponse(resp *heartbeatResponse, initial bool) e
 			return err
 		}
 	}
-	if initial && strings.TrimSpace(resp.HeartbeatSecret) == "" {
-		return errors.New("heartbeat response missing heartbeat_secret")
-	}
 	r.runnerID = strings.TrimSpace(resp.RunnerID)
 	r.orchestratorURL = base
-	for i := range r.apps {
-		r.apps[i].ID = resp.Apps[i].ID
+	// SetApps may have replaced r.apps while this request was in flight.
+	for i := range apps {
+		apps[i].ID = resp.Apps[i].ID
+	}
+	for _, app := range r.apps {
+		if app.ID != "" {
+			seen[app.ID] = true
+		}
+	}
+	// Keep sessions for removed apps until any queued O2R releases arrive.
+	for id, sessions := range r.sessions {
+		if !seen[id] && len(sessions) == 0 {
+			delete(r.sessions, id)
+		}
+	}
+	for id := range seen {
+		if _, exists := r.sessions[id]; !exists {
+			r.sessions[id] = nil
+		}
 	}
 	if !r.intervalOverride {
 		r.heartbeatInterval = parseGoDuration(resp.HeartbeatInterval, defaultHeartbeatInterval)
 	}
 	r.heartbeatTTL = parseGoDuration(resp.HeartbeatTTL, 0)
-	if strings.TrimSpace(resp.HeartbeatSecret) != "" {
-		r.heartbeatSecret = strings.TrimSpace(resp.HeartbeatSecret)
+	r.heartbeatSecret = auth
+	if issued != "" {
+		r.heartbeatSecret = issued
+		if issued != auth {
+			r.seq = 0
+		}
 	}
 	if resp.O2R != nil && strings.TrimSpace(resp.O2R.URL) != "" && !r.closed && (r.o2r == nil || r.o2r.URL != resp.O2R.URL) {
 		if r.o2rCancel != nil {
@@ -447,6 +520,14 @@ func (r *Runner) applyHeartbeatResponse(resp *heartbeatResponse, initial bool) e
 		go r.readO2R(o2rCtx, ch.URL)
 	}
 	return nil
+}
+
+func copySeq(seq *uint64) *uint64 {
+	if seq == nil {
+		return nil
+	}
+	value := *seq
+	return &value
 }
 
 func (r *Runner) readO2R(ctx context.Context, channelURL string) {
@@ -499,23 +580,24 @@ func (r *Runner) handleO2RMessage(ctx context.Context, message map[string]any) {
 		r.mu.Unlock()
 		return
 	}
-	app := r.appLocked(appID)
-	if app == nil {
+	sessions, known := r.sessions[appID]
+	if !known {
 		r.mu.Unlock()
 		slog.Warn("ignoring live runner O2R message for unknown app", "app_id", appID)
 		return
 	}
 	if event == "reserved" {
-		if !slices.Contains(app.SessionIDs, sessionID) {
-			app.SessionIDs = append(app.SessionIDs, sessionID)
+		if !slices.Contains(sessions, sessionID) {
+			sessions = append(sessions, sessionID)
 		}
 		cb = r.onReserve
 	} else {
-		if i := slices.Index(app.SessionIDs, sessionID); i >= 0 {
-			app.SessionIDs = slices.Delete(app.SessionIDs, i, i+1)
+		if i := slices.Index(sessions, sessionID); i >= 0 {
+			sessions = slices.Delete(sessions, i, i+1)
 		}
 		cb = r.onRelease
 	}
+	r.sessions[appID] = sessions
 	r.mu.Unlock()
 	if cb != nil {
 		cb(ev)
