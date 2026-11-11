@@ -88,7 +88,7 @@ func TestNewPriceInfo(t *testing.T) {
 }
 
 func TestRunnerAppValidation(t *testing.T) {
-	valid := AppOptions{App: "echo", RunnerURL: "https://runner.example"}
+	valid := AppOptions{ID: "existing", App: "echo", RunnerURL: "https://runner.example"}
 	for _, tt := range []struct {
 		name string
 		apps []AppOptions
@@ -98,6 +98,8 @@ func TestRunnerAppValidation(t *testing.T) {
 		{"missing URL", []AppOptions{valid, {App: valid.App}}, "app 1: runner URL is required"},
 		{"invalid mode", []AppOptions{valid, {App: valid.App, RunnerURL: valid.RunnerURL, Mode: "single_shot"}}, "app 1: live runner mode"},
 		{"invalid price", []AppOptions{valid, {App: valid.App, RunnerURL: valid.RunnerURL, PriceInfo: PriceInfo{Price: "-1"}}}, "app 1: live runner price"},
+		{"invalid status", []AppOptions{valid, {App: valid.App, RunnerURL: valid.RunnerURL, Status: "warm"}}, "app 1: invalid app status"},
+		{"status whitespace", []AppOptions{valid, {App: valid.App, RunnerURL: valid.RunnerURL, Status: " ready "}}, "app 1: invalid app status"},
 		{"duplicate IDs", []AppOptions{
 			{ID: "echo", App: valid.App, RunnerURL: valid.RunnerURL},
 			{ID: " echo ", App: valid.App, RunnerURL: valid.RunnerURL},
@@ -107,6 +109,17 @@ func TestRunnerAppValidation(t *testing.T) {
 			_, err := New(Options{OrchestratorURL: "https://orchestrator.example", BootstrapSecret: "secret", Apps: tt.apps})
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("New() error = %v, want %q", err, tt.want)
+			}
+			runner, err := New(Options{OrchestratorURL: "https://orchestrator.example", BootstrapSecret: "secret", Apps: []AppOptions{valid}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := runner.payloadLocked()
+			if err := runner.SetApps(tt.apps); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("SetApps() error = %v, want %q", err, tt.want)
+			}
+			if !reflect.DeepEqual(runner.payloadLocked(), before) {
+				t.Fatal("failed SetApps changed existing apps")
 			}
 		})
 	}
@@ -227,7 +240,7 @@ func TestRunnerRegistrationHeartbeatO2RAndUnregister(t *testing.T) {
 				HeartbeatInterval: "50ms",
 				HeartbeatTTL:      "250ms",
 				HeartbeatSecret:   "heartbeat-secret",
-				Apps:              []HeartbeatAppStatus{{ID: "echo"}},
+				Apps:              []HeartbeatAppStatus{{ID: "echo", Status: "ready", SessionIDs: []string{}}},
 				O2R: &Channel{
 					Name:        "o2r",
 					ChannelName: "runner-1-o2r",
@@ -254,6 +267,7 @@ func TestRunnerRegistrationHeartbeatO2RAndUnregister(t *testing.T) {
 	var released []string
 	reg, err := Register(ctx, Options{
 		OrchestratorURL: orch.URL + "/api",
+		AllowedOrigins:  []string{trickle.Server.URL},
 		BootstrapSecret: "bootstrap-secret",
 		Apps: []AppOptions{{
 			RunnerURL: "http://runner.example/app",
@@ -407,8 +421,8 @@ func TestRunnerMultiAppHeartbeatsAndSessions(t *testing.T) {
 			runner.HandleO2RMessage(map[string]any{"event": "reserved", "app_id": "generated", "session": "new"})
 		}
 		json.NewEncoder(w).Encode(HeartbeatResponse{
-			RunnerID: "owner", HeartbeatSecret: secret,
-			Apps: []HeartbeatAppStatus{{ID: "explicit", SessionIDs: []string{"stale"}}, {ID: "generated"}},
+			RunnerID: "owner", HeartbeatSecret: secret, HeartbeatTTL: "30s",
+			Apps: []HeartbeatAppStatus{{ID: "explicit", Status: "ready", SessionIDs: []string{"stale"}}, {ID: "generated", Status: "not-ready", SessionIDs: []string{}}},
 		})
 	}))
 	defer orch.Close()
@@ -416,7 +430,7 @@ func TestRunnerMultiAppHeartbeatsAndSessions(t *testing.T) {
 	apps := []AppOptions{
 		{
 			ID: "explicit", App: "repeated-name", RunnerURL: "https://runner.example/first", Version: "app-v1",
-			Metadata: `{"region":"west"}`, Mode: " persistent ", Proxy: true, Capacity: 3, Status: "warm",
+			Metadata: `{"region":"west"}`, Mode: " persistent ", Proxy: true, Capacity: 3, Status: "not-ready",
 			GPU:       &GPU{ID: "gpu-1", Name: "NVIDIA", VRAMMB: 24576},
 			PriceInfo: PriceInfo{Price: "12.5", Currency: " USD ", Unit: " FIXED "},
 		},
@@ -510,7 +524,7 @@ func TestRunnerMultiAppHeartbeatsAndSessions(t *testing.T) {
 		if first.App != "repeated-name" || second.App != first.App || first.Version != "app-v1" || second.Version != "app-v2" {
 			t.Fatalf("app names/versions = %#v", payload.Apps)
 		}
-		if first.RunnerURL != "https://runner.example/first" || first.Mode != ModePersistent || !first.Proxy || first.Capacity != 3 || first.Status != "warm" || first.Metadata != `{"region":"west"}` || first.GPU.Name != "NVIDIA" || first.PriceInfo != (PriceInfo{Price: "12.5", Currency: "usd", Unit: "fixed"}) {
+		if first.RunnerURL != "https://runner.example/first" || first.Mode != ModePersistent || !first.Proxy || first.Capacity != 3 || first.Status != "not-ready" || first.Metadata != `{"region":"west"}` || first.GPU.Name != "NVIDIA" || first.PriceInfo != (PriceInfo{Price: "12.5", Currency: "usd", Unit: "fixed"}) {
 			t.Fatalf("first app configuration = %#v", first)
 		}
 		if second.RunnerURL != "https://runner.example/second" || second.Mode != ModeSingleShot || second.Proxy || second.Capacity != 1 || second.Status != "ready" || second.GPU != nil || second.PriceInfo != (PriceInfo{Price: "0", Currency: "usd", Unit: "hour"}) {
@@ -525,38 +539,109 @@ func TestRunnerMultiAppHeartbeatsAndSessions(t *testing.T) {
 	}
 }
 
-func TestHeartbeatRejectsInvalidAppResponsesAtomically(t *testing.T) {
+func TestHeartbeatRejectsInvalidResponsesAtomically(t *testing.T) {
+	validApps := `[{"id":"generated","status":"ready","session_ids":[]},{"id":"explicit","status":"not-ready","session_ids":[]}]`
+	withSecond := func(app string) string {
+		return `[{"id":"generated","status":"ready","session_ids":[]},` + app + `]`
+	}
 	for _, tt := range []struct {
-		name string
-		body string
+		name  string
+		field string
+		value string // Empty means the field is omitted.
+		want  string
 	}{
-		{"missing apps", `{"runner_id":"owner","heartbeat_secret":"secret"}`},
-		{"null apps", `{"runner_id":"owner","heartbeat_secret":"secret","apps":null}`},
-		{"missing entry", `{"runner_id":"owner","heartbeat_secret":"secret","apps":[{"id":"generated"}]}`},
-		{"empty ID", `{"runner_id":"owner","heartbeat_secret":"secret","apps":[{"id":"generated"},{"id":" "}]}`},
-		{"duplicate ID", `{"runner_id":"owner","heartbeat_secret":"secret","apps":[{"id":"explicit"},{"id":"explicit"}]}`},
-		{"changed explicit ID", `{"runner_id":"owner","heartbeat_secret":"secret","apps":[{"id":"generated"},{"id":"changed"}]}`},
-		{"invalid orchestrator", `{"runner_id":"owner","heartbeat_secret":"secret","orchestrator":"file:///bad","apps":[{"id":"generated"},{"id":"explicit"}]}`},
+		{"missing runner ID", "runner_id", "", "missing runner_id"},
+		{"padded runner ID", "runner_id", `" owner "`, "whitespace padding"},
+		{"missing TTL", "heartbeat_ttl", "", "heartbeat_ttl"},
+		{"null TTL", "heartbeat_ttl", `null`, "heartbeat_ttl"},
+		{"empty TTL", "heartbeat_ttl", `""`, "heartbeat_ttl"},
+		{"malformed TTL", "heartbeat_ttl", `"30 seconds"`, "heartbeat_ttl"},
+		{"overflowing TTL", "heartbeat_ttl", `"9999999999999999999h"`, "heartbeat_ttl"},
+		{"zero TTL", "heartbeat_ttl", `"0s"`, "heartbeat_ttl"},
+		{"negative TTL", "heartbeat_ttl", `"-1s"`, "heartbeat_ttl"},
+		{"numeric TTL", "heartbeat_ttl", `30`, "cannot unmarshal"},
+		{"malformed interval", "heartbeat_interval", `"bad"`, "heartbeat_interval"},
+		{"zero interval", "heartbeat_interval", `"0s"`, "heartbeat_interval"},
+		{"negative interval", "heartbeat_interval", `"-1s"`, "heartbeat_interval"},
+		{"missing apps", "apps", "", "missing apps"},
+		{"null apps", "apps", `null`, "missing apps"},
+		{"missing entry", "apps", `[{"id":"generated"}]`, "missing apps"},
+		{"empty ID", "apps", withSecond(`{"id":" ","status":"ready","session_ids":[]}`), "missing or duplicate app IDs"},
+		{"padded generated ID", "apps", `[{"id":" generated ","status":"ready","session_ids":[]},{"id":"explicit","status":"ready","session_ids":[]}]`, "whitespace padding"},
+		{"padded retained ID", "apps", validApps[:len(validApps)-1] + `,{"id":" retained ","status":"draining","session_ids":[]}]`, "whitespace padding"},
+		{"duplicate ID", "apps", withSecond(`{"id":"generated","status":"ready","session_ids":[]}`), "missing or duplicate app IDs"},
+		{"changed explicit ID", "apps", withSecond(`{"id":"changed","status":"ready","session_ids":[]}`), "changed app ID"},
+		{"missing status", "apps", withSecond(`{"id":"explicit","session_ids":[]}`), "invalid status"},
+		{"null status", "apps", withSecond(`{"id":"explicit","status":null,"session_ids":[]}`), "invalid status"},
+		{"unknown status", "apps", withSecond(`{"id":"explicit","status":"warm","session_ids":[]}`), "invalid status"},
+		{"missing session list", "apps", withSecond(`{"id":"explicit","status":"ready"}`), "session_ids"},
+		{"null session list", "apps", withSecond(`{"id":"explicit","status":"ready","session_ids":null}`), "session_ids"},
+		{"non-array session list", "apps", withSecond(`{"id":"explicit","status":"ready","session_ids":{}}`), "cannot unmarshal"},
+		{"invalid retained app", "apps", validApps[:len(validApps)-1] + `,{"id":"retained","status":"draining","session_ids":null}]`, "session_ids"},
+		{"wrong seq", "seq", `99`, "echo submitted seq"},
+		{"invalid orchestrator", "orchestrator", `"file:///bad"`, "orchestrator"},
+		{"relative orchestrator", "orchestrator", `"/control"`, "orchestrator"},
+		{"untrusted orchestrator", "orchestrator", `"https://other.example/control"`, "origin is not allowed"},
+		{"orchestrator userinfo", "orchestrator", `"http://user:pass@$HOST/control"`, "credentials or fragments"},
+		{"orchestrator fragment", "orchestrator", `"$ORIGIN/control#fragment"`, "credentials or fragments"},
+		{"empty O2R", "o2r", `{}`, "o2r"},
+		{"O2R query", "o2r", `{"url":"$ORIGIN/o2r?token=value"}`, "query"},
+		{"O2R empty query", "o2r", `{"url":"$ORIGIN/o2r?"}`, "query"},
+		{"relative O2R", "o2r", `{"url":"/o2r"}`, "o2r"},
+		{"invalid O2R scheme", "o2r", `{"url":"file:///o2r"}`, "o2r"},
+		{"untrusted O2R", "o2r", `{"url":"https://other.example/o2r"}`, "origin is not allowed"},
+		{"O2R userinfo", "o2r", `{"url":"http://user:pass@$HOST/o2r"}`, "credentials or fragments"},
+		{"O2R fragment", "o2r", `{"url":"$ORIGIN/o2r#fragment"}`, "credentials or fragments"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			orch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) { fmt.Fprint(w, tt.body) }))
+			orch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				if req.URL.Path != "/runners/heartbeat" {
+					t.Errorf("invalid response started O2R: %s", req.URL.Path)
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				body := map[string]json.RawMessage{
+					"runner_id": json.RawMessage(`"owner"`), "heartbeat_secret": json.RawMessage(`"secret"`), "seq": json.RawMessage(`17`),
+					"heartbeat_ttl": json.RawMessage(`"30s"`), "heartbeat_interval": json.RawMessage(`"1h"`), "apps": json.RawMessage(validApps),
+					"o2r": json.RawMessage(`{"url":"http://` + req.Host + `/o2r"}`),
+				}
+				if tt.value == "" {
+					delete(body, tt.field)
+				} else {
+					value := strings.ReplaceAll(tt.value, "$ORIGIN", "http://"+req.Host)
+					body[tt.field] = json.RawMessage(strings.ReplaceAll(value, "$HOST", req.Host))
+				}
+				json.NewEncoder(w).Encode(body)
+			}))
 			defer orch.Close()
+			var events []HeartbeatEvent
 			runner, err := New(Options{
-				OrchestratorURL: orch.URL, BootstrapSecret: "bootstrap",
-				Apps: []AppOptions{{App: "echo", RunnerURL: "https://runner.example"}, {ID: "explicit", App: "echo", RunnerURL: "https://runner.example"}},
+				OrchestratorURL: orch.URL, BootstrapSecret: "bootstrap", InitialSeq: 17,
+				DisableUnregisterOnClose: true,
+				// Response validation still applies when the interval is overridden.
+				HeartbeatInterval: time.Hour,
+				Apps:              []AppOptions{{App: "echo", RunnerURL: "https://runner.example"}, {ID: "explicit", App: "echo", RunnerURL: "https://runner.example"}},
+				OnHeartbeat:       func(event HeartbeatEvent) { events = append(events, event) },
 			})
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer runner.Close(context.Background())
-			if err := runner.Start(context.Background()); err == nil {
-				t.Fatal("expected invalid heartbeat response error")
+			err = runner.Start(context.Background())
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Start() error = %v, want %q", err, tt.want)
+			}
+			if len(events) != 1 || events[0].Err != err || events[0].Response != nil || events[0].AcceptedSeq != nil || events[0].TTL != 0 || events[0].Request.Seq != 17 || events[0].Credential != "bootstrap" || events[0].At.IsZero() {
+				t.Fatalf("invalid response observation = %#v", events)
+			}
+			if runner.RunnerID() != "" || runner.HeartbeatSecret() != "" || runner.OrchestratorURL() != orch.URL || !reflect.DeepEqual(runner.AppIDs(), []string{"", "explicit"}) || runner.HeartbeatTTL() != 0 || runner.HeartbeatInterval() != time.Hour || runner.O2RChannel() != nil {
+				t.Fatal("invalid response partially changed runner state")
 			}
 			if err := runner.Start(context.Background()); err == nil || !strings.Contains(err.Error(), "already started") {
 				t.Fatalf("Start after failed registration = %v", err)
 			}
-			if runner.RunnerID() != "" || runner.heartbeatSecret != "" || runner.OrchestratorURL() != orch.URL || !reflect.DeepEqual(runner.AppIDs(), []string{"", "explicit"}) {
-				t.Fatal("invalid response partially changed runner state")
+			if err := runner.Close(context.Background()); err != nil {
+				t.Fatal(err)
 			}
 		})
 	}
@@ -573,7 +658,7 @@ func TestRunnerCloseWaitsForStartup(t *testing.T) {
 		mu.Unlock()
 		if req.URL.Path == "/runners/heartbeat" {
 			<-release
-			json.NewEncoder(w).Encode(HeartbeatResponse{RunnerID: "owner", HeartbeatSecret: "secret", Apps: []HeartbeatAppStatus{{ID: "generated"}}})
+			json.NewEncoder(w).Encode(HeartbeatResponse{RunnerID: "owner", HeartbeatSecret: "secret", HeartbeatTTL: "30s", Apps: []HeartbeatAppStatus{{ID: "generated", Status: "ready", SessionIDs: []string{}}}})
 			return
 		}
 		if req.URL.Path != "/runners/owner/unregister" || req.Header.Get("Authorization") != "secret" {
@@ -633,20 +718,30 @@ func TestRunnerReplacesO2RChannel(t *testing.T) {
 	defer trickle.Close()
 	var mu sync.Mutex
 	channel := "first"
+	invalid := false
 	orch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
-		json.NewEncoder(w).Encode(HeartbeatResponse{
-			RunnerID: "owner", HeartbeatSecret: "secret", Apps: []HeartbeatAppStatus{{ID: "a"}, {ID: "b"}},
-			O2R: &Channel{URL: trickle.URL(channel)},
-		})
+		resp := HeartbeatResponse{
+			RunnerID: "owner", HeartbeatSecret: "secret", HeartbeatTTL: "30s",
+			Apps: []HeartbeatAppStatus{{ID: "a", Status: "ready", SessionIDs: []string{}}, {ID: "b", Status: "ready", SessionIDs: []string{}}},
+			O2R:  &Channel{URL: trickle.URL(channel)},
+		}
+		if invalid {
+			resp.HeartbeatTTL = "0s"
+			resp.HeartbeatInterval = "1ms"
+			resp.HeartbeatSecret = "invalid-secret"
+			resp.Orchestrator = "http://" + req.Host + "/moved"
+		}
+		json.NewEncoder(w).Encode(resp)
 	}))
 	defer orch.Close()
 	callback := make(chan SessionEvent, 4)
 	runner, err := New(Options{
 		OrchestratorURL: orch.URL, BootstrapSecret: "bootstrap", DisableUnregisterOnClose: true,
-		Apps:      []AppOptions{{App: "echo", RunnerURL: "https://runner.example/a"}, {App: "echo", RunnerURL: "https://runner.example/b"}},
-		OnReserve: func(event SessionEvent) { callback <- event },
+		AllowedOrigins: []string{trickle.Server.URL},
+		Apps:           []AppOptions{{App: "echo", RunnerURL: "https://runner.example/a"}, {App: "echo", RunnerURL: "https://runner.example/b"}},
+		OnReserve:      func(event SessionEvent) { callback <- event },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -677,6 +772,18 @@ func TestRunnerReplacesO2RChannel(t *testing.T) {
 	waitEvent("a", "before")
 	mu.Lock()
 	channel = "second"
+	invalid = true
+	mu.Unlock()
+	if err := runner.sendHeartbeat(ctx); err == nil {
+		t.Fatal("invalid update succeeded")
+	}
+	if runner.O2RChannel().URL != trickle.URL("first") || runner.HeartbeatTTL() != 30*time.Second || runner.HeartbeatInterval() != defaultHeartbeatInterval || runner.HeartbeatSecret() != "secret" || runner.OrchestratorURL() != orch.URL {
+		t.Fatal("invalid update changed accepted state")
+	}
+	publish("first", 1, "a", "after-rejection")
+	waitEvent("a", "after-rejection")
+	mu.Lock()
+	invalid = false
 	mu.Unlock()
 	if err := runner.sendHeartbeat(ctx); err != nil {
 		t.Fatal(err)
@@ -684,7 +791,7 @@ func TestRunnerReplacesO2RChannel(t *testing.T) {
 	if runner.O2RChannel().URL != trickle.URL("second") {
 		t.Fatal("O2R channel was not replaced")
 	}
-	publish("first", 1, "a", "stale")
+	publish("first", 2, "a", "stale")
 	publish("second", 0, "b", "after")
 	waitEvent("b", "after")
 	staleCtx, cancel := context.WithCancel(ctx)
@@ -693,7 +800,7 @@ func TestRunnerReplacesO2RChannel(t *testing.T) {
 	if err := runner.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := runner.ActiveSessionIDs("a"); !reflect.DeepEqual(got, []string{"before"}) {
+	if got := runner.ActiveSessionIDs("a"); !reflect.DeepEqual(got, []string{"before", "after-rejection"}) {
 		t.Fatalf("retired channel changed sessions: %v", got)
 	}
 	if len(callback) != 0 {

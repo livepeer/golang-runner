@@ -26,6 +26,9 @@ type TrickleSubscriberConfig struct {
 	// Trickle URL to subscribe to (required).
 	URL string
 
+	// Handles all subscription requests. Optional.
+	HTTPClient HTTPDoer
+
 	// Pass in a context for custom cancellation of
 	// the entire subscription.
 	//
@@ -52,11 +55,9 @@ func (e *SequenceNonexistent) Error() string {
 
 const preconnectRefreshTimeout = 20 * time.Second
 
-var preconnectTimeoutErr = errors.New("preconnect timed out")
-
 // TrickleSubscriber represents a trickle streaming reader that always fetches from index -1
 type TrickleSubscriber struct {
-	client     *http.Client
+	client     HTTPDoer
 	url        string
 	mu         sync.Mutex      // Mutex to manage concurrent access
 	pendingGet *http.Response  // Pre-initialized GET request
@@ -89,8 +90,12 @@ func NewTrickleSubscriber(config TrickleSubscriberConfig) (*TrickleSubscriber, e
 		idx = int(*config.Start)
 	}
 
+	client := config.HTTPClient
+	if client == nil {
+		client = httpClient()
+	}
 	return &TrickleSubscriber{
-		client:    httpClient(),
+		client:    client,
 		url:       config.URL,
 		baseCtx:   baseCtx,
 		ctx:       ctx,
@@ -135,28 +140,31 @@ func (c *TrickleSubscriber) SetSeq(seq int) {
 	c.cancelCtx()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	// Reset client in case SetSeq is called due to slow reads falling too far behind
-	c.client = httpClient()
 	c.idx = seq
 	c.ctx, c.cancelCtx = context.WithCancel(c.baseCtx)
+	if c.pendingGet != nil && c.pendingGet.StatusCode == http.StatusOK {
+		c.pendingGet.Body.Close()
+	}
 	c.pendingGet = nil
 	c.preconnectErrorCount = 0
 }
 
-func (c *TrickleSubscriber) connect(ctx context.Context) (*http.Response, error) {
-	url := fmt.Sprintf("%s/%d", c.url, c.idx)
-	slog.Debug("preconnecting", "url", url)
+func connectClient(ctx context.Context, client HTTPDoer, endpoint string) (*http.Response, error) {
+	slog.Debug("preconnecting", "url", endpoint)
 
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
 	if err != nil {
-		slog.Error("Failed to create request for segment", "url", url, "err", err)
+		slog.Error("Failed to create request for segment", "url", endpoint, "err", err)
 		return nil, err
 	}
 
 	// Execute the GET request
-	resp, err := c.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to complete GET for next segment: %w", err)
+	}
+	if resp == nil || resp.Body == nil {
+		return nil, errors.New("HTTP client returned an invalid response or missing body")
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -176,54 +184,62 @@ func (c *TrickleSubscriber) connect(ctx context.Context) (*http.Response, error)
 // This blocks until headers are received  as soon as data is ready.
 // If blocking takes a while, it re-creates the connection every so often.
 func (c *TrickleSubscriber) preconnect() (*http.Response, error) {
-	respCh := make(chan *http.Response, 1)
-	errCh := make(chan error, 1)
-	runConnect := func(ctx context.Context) {
-		go func() {
-			resp, err := c.connect(ctx)
-			if err != nil {
-				if errors.Is(err, preconnectTimeoutErr) {
-					// cancelled as part of a preconnect refresh, so ignore
-					return
-				}
-				errCh <- err
-				return
-			}
-			respCh <- resp
-		}()
+	client := c.client
+	endpoint := fmt.Sprintf("%s/%d", c.url, c.idx)
+	type result struct {
+		resp *http.Response
+		err  error
 	}
-	ctx, cancel := context.WithCancelCause(c.ctx)
-	runConnect(ctx)
+	discard := func(resp *http.Response) {
+		// connect has already closed bodies for non-200 responses.
+		if resp != nil && resp.StatusCode == http.StatusOK {
+			resp.Body.Close()
+		}
+	}
 	for {
-		select {
-		case err := <-errCh:
-			cancel(nil)
-			return nil, err
-		case resp := <-respCh:
-			if resp.StatusCode == http.StatusOK {
-				resp.Body = &cancelOnClose{ReadCloser: resp.Body, cancel: cancel}
-			} else {
-				cancel(nil)
+		ctx, cancel := context.WithCancel(c.ctx)
+		results := make(chan result)
+		go func() {
+			resp, err := connectClient(ctx, client, endpoint)
+			select {
+			case results <- result{resp: resp, err: err}:
+			case <-ctx.Done():
+				discard(resp)
 			}
-			return resp, nil
+		}()
+		select {
+		case r := <-results:
+			if ctx.Err() != nil {
+				discard(r.resp)
+				r.err = ctx.Err()
+			}
+			if r.err != nil {
+				cancel()
+				return nil, r.err
+			}
+			if r.resp.StatusCode == http.StatusOK {
+				r.resp.Body = &cancelOnClose{ReadCloser: r.resp.Body, cancel: cancel}
+			} else {
+				cancel()
+			}
+			return r.resp, nil
+		case <-c.ctx.Done():
+			cancel()
+			return nil, c.ctx.Err()
 		case <-time.After(preconnectRefreshTimeout):
-			// Use a custom error for the timeout to avoid clashes with parent cancellations
-			// Not doing so could lead to a deadlock due to runConnect returning nothing
-			cancel(preconnectTimeoutErr)
-			ctx, cancel = context.WithCancelCause(c.ctx)
-			runConnect(ctx)
+			cancel()
 		}
 	}
 }
 
 type cancelOnClose struct {
 	io.ReadCloser
-	cancel context.CancelCauseFunc
+	cancel context.CancelFunc
 }
 
 func (body *cancelOnClose) Close() error {
 	err := body.ReadCloser.Close()
-	body.cancel(nil)
+	body.cancel()
 	return err
 }
 
@@ -280,9 +296,14 @@ func (c *TrickleSubscriber) Read() (*http.Response, error) {
 	}
 
 	// Set up the next connection
+	ctx := c.ctx
 	go func() {
 		c.mu.Lock()
 		defer c.mu.Unlock()
+		if c.ctx != ctx || ctx.Err() != nil || c.pendingGet != nil {
+			// subscription is not current; exit
+			return
+		}
 		nextConn, err := c.preconnect()
 		if err != nil {
 			slog.Error("failed to preconnect next segment", "url", c.url, "idx", c.idx, "err", err)

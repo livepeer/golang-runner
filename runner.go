@@ -25,6 +25,7 @@ type Runner struct {
 	mu sync.Mutex
 
 	orchestratorURL string
+	origins         originPolicy
 	bootstrapSecret string
 	heartbeatSecret string
 	version         string
@@ -54,6 +55,10 @@ func New(opts Options) (*Runner, error) {
 	if err != nil {
 		return nil, err
 	}
+	origins, err := newOriginPolicy(base, opts.AllowedOrigins)
+	if err != nil {
+		return nil, err
+	}
 	if strings.TrimSpace(opts.BootstrapSecret) == "" {
 		return nil, errors.New("bootstrap secret is required")
 	}
@@ -80,12 +85,13 @@ func New(opts Options) (*Runner, error) {
 		onHeartbeat:       opts.OnHeartbeat,
 		seq:               opts.InitialSeq,
 		orchestratorURL:   base,
+		origins:           origins,
 		bootstrapSecret:   opts.BootstrapSecret,
 		heartbeatSecret:   opts.HeartbeatSecret,
 		version:           moduleVersion(),
 		runnerID:          strings.TrimSpace(opts.RunnerID),
 		apps:              apps,
-		client:            opts.HTTPClient,
+		client:            origins.guardClient(opts.HTTPClient),
 		timeout:           timeout,
 		heartbeatInterval: interval,
 		intervalOverride:  opts.HeartbeatInterval > 0,
@@ -153,8 +159,12 @@ func newAppRequest(opts AppOptions) (HeartbeatApp, error) {
 	if opts.Capacity <= 0 {
 		opts.Capacity = 1
 	}
-	if opts.Status == "" {
+	switch opts.Status {
+	case "":
 		opts.Status = "ready"
+	case "ready", "not-ready", "draining":
+	default:
+		return HeartbeatApp{}, fmt.Errorf("invalid app status %q", opts.Status)
 	}
 	opts.ID = strings.TrimSpace(opts.ID)
 	if opts.GPU != nil {
@@ -416,7 +426,7 @@ func (r *Runner) sendHeartbeat(ctx context.Context) error {
 		if err == nil {
 			event.Response = &resp
 			event.AcceptedSeq = copySeq(resp.Seq)
-			event.TTL = parseGoDuration(resp.HeartbeatTTL, 0)
+			event.TTL, _ = time.ParseDuration(resp.HeartbeatTTL) // Validated before applying.
 		}
 		if r.onHeartbeat != nil {
 			r.onHeartbeat(event)
@@ -441,11 +451,26 @@ func (r *Runner) payloadLocked() HeartbeatRequest {
 }
 
 func (r *Runner) applyHeartbeatResponse(resp *HeartbeatResponse, req HeartbeatRequest, apps []HeartbeatApp, auth string) error {
-	if strings.TrimSpace(resp.RunnerID) == "" {
+	runnerID := strings.TrimSpace(resp.RunnerID)
+	if runnerID == "" {
 		return errors.New("heartbeat response missing runner_id")
+	}
+	if runnerID != resp.RunnerID {
+		return errors.New("heartbeat response runner_id contains whitespace padding")
 	}
 	if req.RunnerID != "" && req.RunnerID != resp.RunnerID {
 		return errors.New("heartbeat response changed runner_id")
+	}
+	ttl, err := time.ParseDuration(resp.HeartbeatTTL)
+	if err != nil || ttl <= 0 {
+		return errors.New("heartbeat response heartbeat_ttl must be a positive Go duration")
+	}
+	interval := defaultHeartbeatInterval
+	if resp.HeartbeatInterval != "" {
+		interval, err = time.ParseDuration(resp.HeartbeatInterval)
+		if err != nil || interval <= 0 {
+			return errors.New("heartbeat response heartbeat_interval must be a positive Go duration")
+		}
 	}
 	// A missing or null array does not confirm that all apps were removed.
 	if resp.Apps == nil || len(resp.Apps) < len(req.Apps) {
@@ -453,30 +478,55 @@ func (r *Runner) applyHeartbeatResponse(resp *HeartbeatResponse, req HeartbeatRe
 	}
 	seen := make(map[string]bool, len(resp.Apps))
 	for i, app := range resp.Apps {
-		if strings.TrimSpace(app.ID) == "" || seen[app.ID] {
+		id := strings.TrimSpace(app.ID)
+		if id == "" || seen[app.ID] {
 			return errors.New("heartbeat response contains missing or duplicate app IDs")
+		}
+		if id != app.ID {
+			return errors.New("heartbeat response app ID contains whitespace padding")
 		}
 		seen[app.ID] = true
 		if i < len(req.Apps) && req.Apps[i].ID != "" && req.Apps[i].ID != app.ID {
 			return fmt.Errorf("heartbeat response changed app ID %q", req.Apps[i].ID)
+		}
+		switch app.Status {
+		case "ready", "not-ready", "draining":
+		default:
+			return fmt.Errorf("heartbeat response app %q has invalid status %q", app.ID, app.Status)
+		}
+		if app.SessionIDs == nil {
+			return fmt.Errorf("heartbeat response app %q missing session_ids array", app.ID)
 		}
 	}
 	issued := strings.TrimSpace(resp.HeartbeatSecret)
 	if resp.Seq != nil && *resp.Seq != req.Seq {
 		return errors.New("heartbeat response did not echo submitted seq")
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	base := r.orchestratorURL
-	if strings.TrimSpace(resp.Orchestrator) != "" {
-		var err error
+	base := ""
+	if resp.Orchestrator != "" {
+		if err := r.origins.validate(resp.Orchestrator); err != nil {
+			return fmt.Errorf("heartbeat response orchestrator: %w", err)
+		}
 		base, err = normalizeBase(resp.Orchestrator)
 		if err != nil {
 			return err
 		}
 	}
-	r.runnerID = strings.TrimSpace(resp.RunnerID)
-	r.orchestratorURL = base
+	if resp.O2R != nil {
+		if err := r.origins.validate(resp.O2R.URL); err != nil {
+			return fmt.Errorf("heartbeat response o2r: %w", err)
+		}
+		if strings.Contains(resp.O2R.URL, "?") {
+			return errors.New("heartbeat response o2r URL must not contain a query")
+		}
+	}
+	// All validation must finish before changing state or starting O2R.
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.runnerID = runnerID
+	if base != "" {
+		r.orchestratorURL = base
+	}
 	// SetApps may have replaced r.apps while this request was in flight.
 	for i := range apps {
 		apps[i].ID = resp.Apps[i].ID
@@ -498,9 +548,9 @@ func (r *Runner) applyHeartbeatResponse(resp *HeartbeatResponse, req HeartbeatRe
 		}
 	}
 	if !r.intervalOverride {
-		r.heartbeatInterval = parseGoDuration(resp.HeartbeatInterval, defaultHeartbeatInterval)
+		r.heartbeatInterval = interval
 	}
-	r.heartbeatTTL = parseGoDuration(resp.HeartbeatTTL, 0)
+	r.heartbeatTTL = ttl
 	r.heartbeatSecret = auth
 	if issued != "" {
 		r.heartbeatSecret = issued
@@ -508,7 +558,7 @@ func (r *Runner) applyHeartbeatResponse(resp *HeartbeatResponse, req HeartbeatRe
 			r.seq = 0
 		}
 	}
-	if resp.O2R != nil && strings.TrimSpace(resp.O2R.URL) != "" && !r.closed && (r.o2r == nil || r.o2r.URL != resp.O2R.URL) {
+	if resp.O2R != nil && !r.closed && (r.o2r == nil || r.o2r.URL != resp.O2R.URL) {
 		if r.o2rCancel != nil {
 			r.o2rCancel()
 		}
@@ -533,7 +583,7 @@ func copySeq(seq *uint64) *uint64 {
 func (r *Runner) readO2R(ctx context.Context, channelURL string) {
 	defer r.wg.Done()
 	start := SequenceStart(0)
-	subscriber, err := NewTrickleSubscriber(TrickleSubscriberConfig{URL: channelURL, Ctx: ctx, Start: &start})
+	subscriber, err := NewTrickleSubscriber(TrickleSubscriberConfig{URL: channelURL, Ctx: ctx, Start: &start, HTTPClient: r.client})
 	if err != nil {
 		slog.Warn("live runner O2R reader failed to start", "err", err)
 		return
