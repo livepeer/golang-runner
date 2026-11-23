@@ -45,6 +45,7 @@ type Runner struct {
 	seq                 uint64
 	o2r                 *Channel
 	o2rCancel           context.CancelFunc
+	o2rNextSeq          SequenceStart
 	closed              bool
 	heartbeatLoopCancel context.CancelFunc
 	wg                  sync.WaitGroup
@@ -558,16 +559,19 @@ func (r *Runner) applyHeartbeatResponse(resp *HeartbeatResponse, req HeartbeatRe
 			r.seq = 0
 		}
 	}
-	if resp.O2R != nil && !r.closed && (r.o2r == nil || r.o2r.URL != resp.O2R.URL) {
+	if resp.O2R != nil && !r.closed && (r.o2rCancel == nil || r.o2r.URL != resp.O2R.URL) {
 		if r.o2rCancel != nil {
 			r.o2rCancel()
 		}
 		ch := *resp.O2R
+		if r.o2r == nil || r.o2r.URL != ch.URL {
+			r.o2rNextSeq = 0
+		}
 		r.o2r = &ch
 		o2rCtx, cancel := context.WithCancel(context.Background())
 		r.o2rCancel = cancel
 		r.wg.Add(1)
-		go r.readO2R(o2rCtx, ch.URL)
+		go r.readO2R(o2rCtx, ch.URL, r.o2rNextSeq)
 	}
 	return nil
 }
@@ -580,17 +584,31 @@ func copySeq(seq *uint64) *uint64 {
 	return &value
 }
 
-func (r *Runner) readO2R(ctx context.Context, channelURL string) {
+func (r *Runner) readO2R(ctx context.Context, channelURL string, start SequenceStart) {
 	defer r.wg.Done()
-	start := SequenceStart(0)
+	next := start
+	defer func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		// Replacement and shutdown cancel this context while holding r.mu.
+		if ctx.Err() == nil {
+			r.o2rCancel()
+			r.o2rCancel = nil
+			r.o2rNextSeq = next
+		}
+	}()
 	subscriber, err := NewTrickleSubscriber(TrickleSubscriberConfig{URL: channelURL, Ctx: ctx, Start: &start, HTTPClient: r.client})
 	if err != nil {
 		slog.Warn("live runner O2R reader failed to start", "err", err)
 		return
 	}
+	defer subscriber.close()
 	reader := NewJSONReader(subscriber)
 	for {
-		msg, err := reader.Next()
+		msg, nextSeq, err := reader.next()
+		if nextSeq >= 0 {
+			next = SequenceStart(nextSeq)
+		}
 		if err != nil {
 			if ctx.Err() == nil {
 				slog.Warn("live runner O2R reader stopped", "err", err)
