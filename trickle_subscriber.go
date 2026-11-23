@@ -142,11 +142,22 @@ func (c *TrickleSubscriber) SetSeq(seq int) {
 	defer c.mu.Unlock()
 	c.idx = seq
 	c.ctx, c.cancelCtx = context.WithCancel(c.baseCtx)
+	c.discardPendingLocked()
+	c.preconnectErrorCount = 0
+}
+
+func (c *TrickleSubscriber) close() {
+	c.cancelCtx()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.discardPendingLocked()
+}
+
+func (c *TrickleSubscriber) discardPendingLocked() {
 	if c.pendingGet != nil && c.pendingGet.StatusCode == http.StatusOK {
 		c.pendingGet.Body.Close()
 	}
 	c.pendingGet = nil
-	c.preconnectErrorCount = 0
 }
 
 func connectClient(ctx context.Context, client HTTPDoer, endpoint string) (*http.Response, error) {

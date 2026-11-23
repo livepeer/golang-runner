@@ -36,15 +36,21 @@ func NewJSONReader(s *TrickleSubscriber) *JSONReader {
 }
 
 func (r *JSONReader) Next() (map[string]any, error) {
-	body, err := readJSONSegment(r.subscriber)
+	msg, _, err := r.next()
+	return msg, err
+}
+
+// next returns the sequence to resume at, or a negative value if it is unknown.
+func (r *JSONReader) next() (map[string]any, int, error) {
+	body, nextSeq, err := readJSONSegment(r.subscriber)
 	if err != nil || body == nil {
-		return nil, err
+		return nil, nextSeq, err
 	}
 	var msg map[string]any
 	if err := json.Unmarshal(body, &msg); err != nil {
-		return nil, err
+		return nil, nextSeq, err
 	}
-	return msg, nil
+	return msg, nextSeq, nil
 }
 
 type JSONLWriter struct {
@@ -79,7 +85,7 @@ func NewJSONLReader(s *TrickleSubscriber) *JSONLReader {
 
 func (r *JSONLReader) Next() (map[string]any, error) {
 	for len(r.pending) == 0 {
-		body, err := readJSONSegment(r.subscriber)
+		body, _, err := readJSONSegment(r.subscriber)
 		if err != nil || body == nil {
 			return nil, err
 		}
@@ -103,22 +109,33 @@ func (r *JSONLReader) Next() (map[string]any, error) {
 	return msg, nil
 }
 
-func readJSONSegment(subscriber *TrickleSubscriber) ([]byte, error) {
+func readJSONSegment(subscriber *TrickleSubscriber) ([]byte, int, error) {
+	nextSeq := -1
 	for attempts := 0; attempts < 6; attempts++ {
 		resp, err := subscriber.Read()
 		if err != nil {
 			var missing *SequenceNonexistent
 			if errors.As(err, &missing) {
-				subscriber.SetSeq(missing.Latest)
+				nextSeq = missing.Latest
+				subscriber.SetSeq(nextSeq)
 				continue
 			}
 			if errors.Is(err, EOS) || errors.Is(err, StreamNotFoundErr) {
-				return nil, nil
+				return nil, nextSeq, nil
 			}
-			return nil, err
+			return nil, nextSeq, err
 		}
 		defer resp.Body.Close()
-		return io.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
+		if seq := GetSeq(resp); seq >= 0 {
+			nextSeq = seq
+			// Retry a partial body. Skip fully read segments even if their
+			// JSON is malformed, since retrying would return the same data.
+			if err == nil {
+				nextSeq++
+			}
+		}
+		return body, nextSeq, err
 	}
-	return nil, errors.New("trickle JSON reader exhausted sequence reset retries")
+	return nil, nextSeq, errors.New("trickle JSON reader exhausted sequence reset retries")
 }

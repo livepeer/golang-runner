@@ -12,7 +12,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"testing/iotest"
+	"testing/synctest"
 	"time"
 )
 
@@ -806,6 +809,137 @@ func TestRunnerReplacesO2RChannel(t *testing.T) {
 	if len(callback) != 0 {
 		t.Fatal("retired channel invoked callback")
 	}
+}
+
+func TestRunnerRestartsEndedO2RReader(t *testing.T) {
+	t.Run("resume same channel", func(t *testing.T) { testRunnerRestartsEndedO2RReader(t, false) })
+	t.Run("register new channel", func(t *testing.T) { testRunnerRestartsEndedO2RReader(t, true) })
+}
+
+func testRunnerRestartsEndedO2RReader(t *testing.T, restart bool) {
+	synctest.Test(t, func(t *testing.T) {
+		const base = "http://orchestrator.example"
+		start := make(chan struct{})
+		ended := make(chan struct{})
+		recovered := make(chan struct{})
+		var auth []string
+		var firstReads atomic.Int32
+		reservations := make(chan SessionEvent, 2)
+		segment := func(seq int, body io.Reader) *http.Response {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Lp-Trickle-Seq": {strconv.Itoa(seq)}},
+				Body:       io.NopCloser(body),
+			}
+		}
+		reservation := func(seq int, session string) *http.Response {
+			return segment(seq, strings.NewReader(fmt.Sprintf(`{"event":"reserved","app_id":"app","session":%q}`, session)))
+		}
+		client := testHTTPDoer(func(req *http.Request) (*http.Response, error) {
+			switch req.URL.Path {
+			case "/runners/heartbeat":
+				auth = append(auth, req.Header.Get("Authorization"))
+				resp := HeartbeatResponse{
+					RunnerID: "owner", HeartbeatTTL: "30s", O2R: &Channel{URL: base + "/o2r"},
+					Apps: []HeartbeatAppStatus{{ID: "app", Status: "ready", SessionIDs: []string{}}},
+				}
+				if len(auth) == 1 {
+					resp.HeartbeatSecret = "heartbeat"
+				} else if restart && len(auth) == 3 {
+					return &http.Response{StatusCode: http.StatusUnauthorized, Body: http.NoBody}, nil
+				} else if restart && len(auth) >= 4 {
+					resp.O2R.URL = base + "/new-o2r"
+					resp.HeartbeatSecret = "new-heartbeat"
+				} else if len(auth) == 3 {
+					close(recovered)
+				}
+				body, err := json.Marshal(resp)
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(string(body)))}, err
+			case "/o2r/0":
+				firstReads.Add(1)
+				select {
+				case <-start:
+				case <-req.Context().Done():
+					return nil, req.Context().Err()
+				}
+				return reservation(0, "first"), nil
+			case "/o2r/1":
+				select {
+				case <-ended:
+				case <-req.Context().Done():
+					return nil, req.Context().Err()
+				}
+				select {
+				case <-recovered:
+					return reservation(1, "fresh"), nil
+				default:
+				}
+				if restart {
+					return &http.Response{StatusCode: http.StatusNotFound, Body: http.NoBody}, nil
+				}
+				return segment(1, iotest.ErrReader(io.ErrUnexpectedEOF)), nil
+			case "/new-o2r/0":
+				return reservation(0, "fresh"), nil
+			case "/o2r/2":
+				select {
+				case <-recovered:
+				default:
+					return reservation(2, "prefetched"), nil
+				}
+				fallthrough
+			case "/new-o2r/1":
+				<-req.Context().Done()
+				return nil, req.Context().Err()
+			}
+			t.Errorf("unexpected request: %s", req.URL.Path)
+			return &http.Response{StatusCode: http.StatusNotFound, Body: http.NoBody}, nil
+		})
+		runner, err := Register(t.Context(), Options{
+			OrchestratorURL: base, BootstrapSecret: "bootstrap", HTTPClient: client,
+			HeartbeatInterval: time.Second, DisableUnregisterOnClose: true,
+			Apps:      []AppOptions{{ID: "app", App: "echo", RunnerURL: "https://runner.example"}},
+			OnReserve: func(event SessionEvent) { reservations <- event },
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer runner.Close(t.Context())
+
+		time.Sleep(time.Second)
+		synctest.Wait()
+		if firstReads.Load() != 1 || len(auth) != 2 {
+			t.Fatalf("healthy channel: reads = %d, heartbeat credentials = %v", firstReads.Load(), auth)
+		}
+		waitReservation := func(want string) {
+			t.Helper()
+			select {
+			case event := <-reservations:
+				if event.SessionID != want {
+					t.Fatalf("reservation = %q, want %q", event.SessionID, want)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatalf("no reservation for %q", want)
+			}
+		}
+		close(start)
+		waitReservation("first")
+		close(ended)
+		synctest.Wait()
+		waitReservation("fresh")
+		if err := runner.Close(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if got := runner.ActiveSessionIDs("app"); !reflect.DeepEqual(got, []string{"first", "fresh"}) {
+			t.Fatalf("active sessions = %v", got)
+		}
+		wantAuth := []string{"bootstrap", "heartbeat", "heartbeat"}
+		if restart {
+			wantAuth = append(wantAuth, "bootstrap")
+		}
+		if !reflect.DeepEqual(auth, wantAuth) {
+			t.Fatalf("heartbeat credentials = %v, want %v", auth, wantAuth)
+		}
+	})
 }
 
 func TestHeadersProxyChannelsAndStopUseSessionControl(t *testing.T) {
